@@ -306,13 +306,19 @@ def create_app() -> Flask:
                 run_id=target_run.id,
             )
         except Exception as e:
-            from backend.ai.gemma_api_provider import GemmaApiTransientError, GemmaApiError
+            from backend.ai.gemma_api_provider import GemmaApiTransientError, GemmaApiError, GemmaApiResponseError
             if isinstance(e, GemmaApiTransientError):
                 return jsonify({
                     "error": "Hosted Gemma model is temporarily unavailable (upstream HTTP 500). Please retry in a few moments.",
                     "status": 503,
                     "error_type": "upstream_transient_error",
                 }), 503
+            if isinstance(e, GemmaApiResponseError):
+                return jsonify({
+                    "error": f"Hosted Gemma response error: {e.sanitized_message}",
+                    "status": 502,
+                    "error_type": "model_response_error",
+                }), 502
             if isinstance(e, GemmaApiError):
                 return jsonify({
                     "error": f"Hosted Gemma error: {e.sanitized_message}",
@@ -486,7 +492,7 @@ def create_app() -> Flask:
             }), e.code
 
         logger.error("Unhandled API exception: %s", e, exc_info=True)
-        from backend.ai.gemma_api_provider import GemmaApiTransientError, GemmaApiError
+        from backend.ai.gemma_api_provider import GemmaApiTransientError, GemmaApiError, GemmaApiResponseError
         if isinstance(e, GemmaApiTransientError):
             return jsonify({
                 "error": "Hosted Gemma model is temporarily unavailable (upstream HTTP 500). Please retry in a few moments.",
@@ -494,6 +500,13 @@ def create_app() -> Flask:
                 "error_type": "upstream_transient_error",
                 "provider": "gemma_api",
             }), 503
+        if isinstance(e, GemmaApiResponseError):
+            return jsonify({
+                "error": f"Hosted Gemma response error: {e.sanitized_message}",
+                "status": 502,
+                "error_type": "model_response_error",
+                "provider": "gemma_api",
+            }), 502
         if isinstance(e, GemmaApiError):
             return jsonify({
                 "error": f"Hosted Gemma error: {e.sanitized_message}",
