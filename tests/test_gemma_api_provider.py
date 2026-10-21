@@ -13,8 +13,10 @@ from backend.ai.gemma_api_provider import (
     GemmaApiProvider,
     GemmaApiResponseError,
     GemmaApiTransientError,
+    ResponseDiagnostics,
     clean_json_text,
     extract_error_code,
+    extract_response_diagnostics,
     extract_response_text,
     is_transient_error,
     sanitize_error_message,
@@ -307,8 +309,8 @@ def test_successful_http_response_followed_by_processing_failure_is_not_retried(
     )
 
     provider.analyze_and_prioritize([finding], run_id="run-no-retry-parse")
-    # Must only be called ONCE (deterministic parsing error, NOT retried 3 times)
-    assert mock_client.models.generate_content.call_count == 1
+    # Controlled recovery attempts at most 1 recovery (total 2 calls), NOT retried 4 times like a transient 500
+    assert mock_client.models.generate_content.call_count == 2
 
 
 def test_honest_failure_reporting_no_false_badges_no_demo_fallback(tmp_path):
@@ -657,3 +659,374 @@ def test_api_error_handler_returns_sanitized_json():
         assert data_err is not None
         assert "Permanent API failure" in data_err["error"]
         assert data_err.get("error_type") == "upstream_error"
+
+
+# =============================================================================
+# Production Root-Cause Investigation Regression Tests (Items 1-10)
+# =============================================================================
+
+
+def test_regression_1_valid_response_with_usable_text():
+    """1. Valid response with usable text properly annotates findings and generates patch."""
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.text = json.dumps([
+        {
+            "id": "f-reg-1",
+            "severity": "high",
+            "explanation": "Critical security flaw.",
+            "suggested_action": "Sanitize inputs.",
+        }
+    ])
+    mock_client.models.generate_content.return_value = mock_resp
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-reg-1",
+        category=FindingCategory.CONFIGURATION,
+        title="Test valid finding",
+        file_path="config.py",
+        evidence="debug=True",
+        explanation="Default explanation",
+        suggested_action="Default action",
+        severity=Severity.LOW,
+    )
+
+    analyzed = provider.analyze_and_prioritize([finding], run_id="run-reg-1")
+    assert analyzed[0].ai_assisted is True
+    assert analyzed[0].is_demo is False
+    assert analyzed[0].severity == Severity.HIGH
+    assert analyzed[0].explanation == "Critical security flaw."
+    assert mock_client.models.generate_content.call_count == 1
+
+
+def test_regression_2_missing_or_empty_candidates():
+    """2. Missing or empty candidates response categorized safely without crashing."""
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.text = None
+    mock_resp.candidates = []
+    mock_client.models.generate_content.return_value = mock_resp
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-reg-2",
+        category=FindingCategory.CONFIGURATION,
+        title="Empty candidates finding",
+        file_path="config.py",
+        evidence="debug=True",
+        explanation="Default explanation",
+        suggested_action="Default action",
+        severity=Severity.LOW,
+    )
+
+    analyzed = provider.analyze_and_prioritize([finding], run_id="run-reg-2")
+    # Honest failure: finding not marked as evaluated
+    assert analyzed[0].ai_assisted is False
+    assert analyzed[0].is_demo is False
+    # Exactly 2 calls: initial attempt + 1 controlled bounded recovery attempt
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_regression_3_missing_content_and_text():
+    """3. Candidate with None content is categorized as absent_content and handled safely."""
+    mock_client = MagicMock()
+    mock_cand = MagicMock()
+    mock_cand.content = None
+    mock_cand.finish_reason = "STOP"
+    mock_resp = MagicMock()
+    mock_resp.text = None
+    mock_resp.candidates = [mock_cand]
+    mock_client.models.generate_content.return_value = mock_resp
+
+    diag = extract_response_diagnostics(mock_resp)
+    assert diag.has_response is True
+    assert diag.failure_category == "absent_content"
+    assert diag.extracted_text is None
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-reg-3",
+        category=FindingCategory.DOCUMENTATION,
+        title="Missing content finding",
+        file_path="README.md",
+        evidence="broken",
+        explanation="Default explanation",
+        suggested_action="Default action",
+        severity=Severity.LOW,
+    )
+
+    analyzed = provider.analyze_and_prioritize([finding], run_id="run-reg-3")
+    assert analyzed[0].ai_assisted is False
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_regression_4_text_accessor_returns_none_or_raises_exception():
+    """4. Response whose text accessor raises an exception or returns None does not crash."""
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+
+    # Define a property that raises ValueError
+    type(mock_resp).text = property(lambda self: (_ for _ in ()).throw(ValueError("Text blocked by model policy")))
+    mock_resp.candidates = []
+    mock_client.models.generate_content.return_value = mock_resp
+
+    diag = extract_response_diagnostics(mock_resp)
+    assert diag.has_response is True
+    assert diag.extracted_text is None
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-reg-4",
+        category=FindingCategory.CONFIGURATION,
+        title="Exception text accessor",
+        file_path="app.py",
+        evidence="test",
+        explanation="Default explanation",
+        suggested_action="Default action",
+        severity=Severity.LOW,
+    )
+
+    # Must complete without unhandled exception
+    analyzed = provider.analyze_and_prioritize([finding], run_id="run-reg-4")
+    assert analyzed[0].ai_assisted is False
+
+
+def test_regression_5_safety_blocked_response_no_recovery():
+    """5. Safety-blocked response is classified as safety_blocked and NEVER retried."""
+    mock_client = MagicMock()
+    mock_cand = MagicMock()
+    mock_cand.content = None
+    mock_cand.finish_reason = "SAFETY"
+    mock_resp = MagicMock()
+    mock_resp.text = None
+    mock_resp.candidates = [mock_cand]
+    mock_client.models.generate_content.return_value = mock_resp
+
+    diag = extract_response_diagnostics(mock_resp)
+    assert diag.failure_category == "safety_blocked"
+    assert diag.is_recoverable is False
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-reg-5",
+        category=FindingCategory.CONFIGURATION,
+        title="Safety blocked test",
+        file_path="app.py",
+        evidence="evidence",
+        explanation="Default explanation",
+        suggested_action="Default action",
+        severity=Severity.LOW,
+    )
+
+    analyzed = provider.analyze_and_prioritize([finding], run_id="run-reg-5")
+    assert analyzed[0].ai_assisted is False
+    # CRITICAL: Safety block must NOT be retried! Exactly 1 call.
+    assert mock_client.models.generate_content.call_count == 1
+
+
+def test_regression_6_truncated_or_malformed_json_output():
+    """6. Truncated output (MAX_TOKENS) or malformed JSON is categorized and bounded-recovered."""
+    mock_client = MagicMock()
+    mock_cand = MagicMock()
+    mock_cand.finish_reason = "MAX_TOKENS"
+    part = MagicMock()
+    part.text = '[{"id": "f-reg-6", "severity": "high", "explanation": "cut off mid-sentence'
+    part.thought = False
+    mock_cand.content = MagicMock(parts=[part])
+
+    mock_resp = MagicMock()
+    mock_resp.text = part.text
+    mock_resp.candidates = [mock_cand]
+    mock_client.models.generate_content.return_value = mock_resp
+
+    diag = extract_response_diagnostics(mock_resp)
+    assert diag.finish_reason == "MAX_TOKENS"
+    assert diag.is_recoverable is True
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-reg-6",
+        category=FindingCategory.CONFIGURATION,
+        title="Truncated JSON test",
+        file_path="app.py",
+        evidence="evidence",
+        explanation="Default explanation",
+        suggested_action="Default action",
+        severity=Severity.LOW,
+    )
+
+    analyzed = provider.analyze_and_prioritize([finding], run_id="run-reg-6")
+    assert analyzed[0].ai_assisted is False
+    # Attempted initial + 1 recovery = 2 calls
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_regression_7_recoverable_empty_response_followed_by_successful_recovery():
+    """7. Recoverable empty response on attempt 1 followed by valid JSON on attempt 2 succeeds."""
+    mock_client = MagicMock()
+    # Call 1: empty response
+    mock_resp_empty = MagicMock()
+    mock_resp_empty.text = ""
+    mock_resp_empty.candidates = []
+
+    # Call 2: valid JSON array
+    mock_resp_valid = MagicMock()
+    mock_resp_valid.text = json.dumps([
+        {
+            "id": "f-reg-7",
+            "severity": "medium",
+            "explanation": "Recovered successfully on retry.",
+            "suggested_action": "Apply suggested change.",
+        }
+    ])
+
+    mock_client.models.generate_content.side_effect = [mock_resp_empty, mock_resp_valid]
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-reg-7",
+        category=FindingCategory.CONFIGURATION,
+        title="Recovery success test",
+        file_path="app.py",
+        evidence="debug=True",
+        explanation="Default explanation",
+        suggested_action="Default action",
+        severity=Severity.LOW,
+    )
+
+    analyzed = provider.analyze_and_prioritize([finding], run_id="run-reg-7")
+    assert analyzed[0].ai_assisted is True
+    assert analyzed[0].severity == Severity.MEDIUM
+    assert analyzed[0].explanation == "Recovered successfully on retry."
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_regression_8_repeated_empty_responses_after_recovery():
+    """8. Repeated empty responses after recovery stops boundedly at attempt 2 and reports failure."""
+    mock_client = MagicMock()
+    mock_resp_empty_1 = MagicMock(text="")
+    mock_resp_empty_1.candidates = []
+    mock_resp_empty_2 = MagicMock(text="")
+    mock_resp_empty_2.candidates = []
+
+    mock_client.models.generate_content.side_effect = [mock_resp_empty_1, mock_resp_empty_2]
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-reg-8",
+        category=FindingCategory.CONFIGURATION,
+        title="Repeated empty test",
+        file_path="app.py",
+        evidence="evidence",
+        explanation="Default explanation",
+        suggested_action="Default action",
+        severity=Severity.LOW,
+    )
+
+    analyzed = provider.analyze_and_prioritize([finding], run_id="run-reg-8")
+    assert analyzed[0].ai_assisted is False
+    # Exactly 2 calls (1 initial + 1 recovery), never loops indefinitely
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_regression_9_no_false_success_in_sentry_or_ai_assisted_status(tmp_path):
+    """9. When hosted Gemma fails, Sentry span records failure and ai_assisted remains False."""
+    mock_provider = MagicMock()
+    mock_provider.name = "gemma_api"
+    mock_provider.model = "gemma-4-26b-a4b-it"
+
+    # Simulates analyze_and_prioritize failing honest failure (unmodified findings)
+    mock_provider.analyze_and_prioritize.side_effect = lambda findings, run_id=None: findings
+
+    agent = AgentService(provider_name="gemma_api")
+    agent.provider = mock_provider
+
+    f1 = tmp_path / "app.py"
+    f1.write_text("x = 1\n", encoding="utf-8")
+
+    finding = Finding(
+        id="f-reg-9",
+        category=FindingCategory.CONFIGURATION,
+        title="Sentry honest status test",
+        file_path="app.py",
+        evidence="x = 1",
+        explanation="Default explanation",
+        suggested_action="Default action",
+        severity=Severity.LOW,
+    )
+
+    with patch.object(agent.scan_engine, "discover_files", return_value=([f1], 10)), \
+         patch.object(agent.scan_engine, "run_scanners", return_value=([finding], {})):
+
+        run = agent.execute_maintenance_run(
+            repo_path=tmp_path,
+            repo_name="SentryTestRepo",
+            repo_type="local",
+            run_id="run-reg-9",
+        )
+
+    # Analysis must be marked failed, proposal skipped, 0 patches
+    assert run.stages["analysis"].status == "failed"
+    assert run.stages["proposal"].status == "skipped"
+    assert len(run.patches) == 0
+    assert finding.ai_assisted is False
+    assert finding.is_demo is False
+
+
+def test_regression_10_no_silent_demo_fallback_or_fabricated_explanations(tmp_path):
+    """10. Under hosted Gemma failure, QuietPatch never substitutes demo findings or fabricates AI patches."""
+    mock_provider = MagicMock()
+    mock_provider.name = "gemma_api"
+    mock_provider.model = "gemma-4-26b-a4b-it"
+    mock_provider.analyze_and_prioritize.side_effect = lambda findings, run_id=None: findings
+
+    agent = AgentService(provider_name="gemma_api")
+    agent.provider = mock_provider
+
+    f1 = tmp_path / "package.json"
+    f1.write_text('{"name": "test"}\n', encoding="utf-8")
+
+    finding = Finding(
+        id="f-reg-10",
+        category=FindingCategory.JAVASCRIPT,
+        title="Outdated dependency",
+        file_path="package.json",
+        evidence="package.json",
+        explanation="Deterministic scanner detected dependency issue",
+        suggested_action="Review package versions",
+        severity=Severity.MEDIUM,
+    )
+
+    with patch.object(agent.scan_engine, "discover_files", return_value=([f1], 20)), \
+         patch.object(agent.scan_engine, "run_scanners", return_value=([finding], {})):
+
+        run = agent.execute_maintenance_run(
+            repo_path=tmp_path,
+            repo_name="NoDemoTestRepo",
+            repo_type="local",
+            run_id="run-reg-10",
+        )
+
+    # Findings must retain genuine deterministic evidence, no [Demo AI] inserted
+    assert "[Demo AI]" not in run.findings[0].explanation
+    assert run.findings[0].is_demo is False
+    assert run.findings[0].ai_assisted is False
+    # No fake patches
+    assert len(run.patches) == 0

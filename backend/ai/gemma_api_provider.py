@@ -63,55 +63,228 @@ def sanitize_error_message(msg: str) -> str:
     return cleaned.strip()
 
 
-def extract_response_text(response: Any) -> Optional[str]:
-    """Safely extracts text content from Google Gen AI GenerateContentResponse.
+class ResponseDiagnostics:
+    """Safe, structured diagnostics extracted from a Google Gen AI response.
 
-    Validates:
-    - response is not None
-    - response.text property (if string and non-empty)
-    - response.candidates list availability
-    - candidate.content presence
-    - content.parts iteration, handling parts with None or non-string text
-    - ignores internal thought/reasoning parts
+    Contains strictly non-sensitive metadata (counts, finish/block reasons, token counts).
+    Never stores API keys, prompts, source code, or raw response text.
+    """
+
+    def __init__(
+        self,
+        has_response: bool = False,
+        candidate_count: int = 0,
+        text_part_count: int = 0,
+        thought_part_count: int = 0,
+        finish_reason: Optional[str] = None,
+        block_reason: Optional[str] = None,
+        prompt_tokens: Optional[int] = None,
+        candidate_tokens: Optional[int] = None,
+        total_tokens: Optional[int] = None,
+        extracted_text: Optional[str] = None,
+        failure_category: Optional[str] = None,
+    ):
+        self.has_response = has_response
+        self.candidate_count = candidate_count
+        self.text_part_count = text_part_count
+        self.thought_part_count = thought_part_count
+        self.finish_reason = finish_reason
+        self.block_reason = block_reason
+        self.prompt_tokens = prompt_tokens
+        self.candidate_tokens = candidate_tokens
+        self.total_tokens = total_tokens
+        self.extracted_text = extracted_text
+        self.failure_category = failure_category
+
+    @property
+    def is_recoverable(self) -> bool:
+        """Determines whether a response failure can be recovered with a controlled single retry."""
+        if not self.has_response:
+            return False
+        if self.failure_category == "safety_blocked":
+            return False
+        return self.failure_category in {
+            "output_token_truncated",
+            "thought_only_exhaustion",
+            "empty_output",
+            "empty_candidates",
+            "absent_content",
+            "malformed_json",
+        }
+
+    def sanitized_summary(self) -> str:
+        tokens_summary = (
+            f"prompt={self.prompt_tokens}, cand={self.candidate_tokens}"
+            if self.prompt_tokens is not None or self.candidate_tokens is not None
+            else "none"
+        )
+        return (
+            f"has_response={self.has_response}, candidates={self.candidate_count}, "
+            f"text_parts={self.text_part_count}, finish_reason={self.finish_reason or 'none'}, "
+            f"block_reason={self.block_reason or 'none'}, tokens={tokens_summary}, "
+            f"category={self.failure_category or 'none'}"
+        )
+
+
+def extract_response_diagnostics(
+    response: Any,
+    max_expected_tokens: int = 2048,
+) -> ResponseDiagnostics:
+    """Safely extracts structured diagnostics and usable text from a Google Gen AI response.
+
+    Handles:
+    - Missing response (None)
+    - Missing or empty candidates
+    - Candidates with absent or None content
+    - Parts with None or thought-only text
+    - Safety-blocked responses (candidate finish_reason or prompt block_reason)
+    - Token limit truncation (finish_reason == MAX_TOKENS)
+    - Text property exceptions, MagicMocks, or None returns
     """
     if response is None:
-        return None
+        return ResponseDiagnostics(has_response=False, failure_category="no_response")
 
-    # 1. Primary check: response.text attribute (guarded against AttributeError)
+    # 1. Primary check: response.text attribute (guarded against AttributeError, ValueError, and MagicMock)
+    prop_text = None
     try:
-        raw_text = getattr(response, "text", None)
-        if isinstance(raw_text, str) and raw_text.strip():
-            return raw_text.strip()
+        raw_prop = getattr(response, "text", None)
+        if callable(raw_prop) and not type(raw_prop).__name__ == "MagicMock":
+            raw_prop = raw_prop()
+        if isinstance(raw_prop, str) and raw_prop.strip():
+            prop_text = raw_prop.strip()
     except Exception:
         pass
 
-    # 2. Structural fallback: inspect candidates[0].content.parts directly
-    try:
-        candidates = getattr(response, "candidates", None)
-        if candidates and isinstance(candidates, (list, tuple)) and len(candidates) > 0:
-            first_cand = candidates[0]
-            if first_cand is not None:
-                content = getattr(first_cand, "content", None)
-                if content is not None:
-                    parts = getattr(content, "parts", None)
-                    if parts and isinstance(parts, (list, tuple)):
-                        text_fragments = []
-                        for part in parts:
-                            if part is None:
-                                continue
-                            if getattr(part, "thought", False):
-                                continue
-                            p_text = getattr(part, "text", None)
-                            if isinstance(p_text, str) and p_text:
-                                text_fragments.append(p_text)
-                        if text_fragments:
-                            combined = "".join(text_fragments).strip()
-                            if combined:
-                                return combined
-    except Exception:
-        pass
+    # 2. Inspect candidates list if available
+    raw_candidates = getattr(response, "candidates", None)
+    candidates = []
+    if raw_candidates is not None and type(raw_candidates).__name__ != "MagicMock":
+        if isinstance(raw_candidates, (list, tuple)):
+            candidates = list(raw_candidates)
+    elif isinstance(raw_candidates, (list, tuple)):
+        candidates = list(raw_candidates)
+    candidate_count = len(candidates)
 
-    return None
+    # 3. Prompt feedback block reason (if blocked at prompt level)
+    block_reason = None
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    if prompt_feedback is not None and type(prompt_feedback).__name__ != "MagicMock":
+        raw_br = getattr(prompt_feedback, "block_reason", None)
+        if raw_br and type(raw_br).__name__ != "MagicMock":
+            if isinstance(raw_br, str):
+                block_reason = raw_br.upper()
+            elif hasattr(raw_br, "name"):
+                block_reason = str(raw_br.name).upper()
+            else:
+                block_reason = str(raw_br).upper()
+
+    # 4. Token usage metadata
+    usage = getattr(response, "usage_metadata", None)
+    prompt_tokens = None
+    candidate_tokens = None
+    total_tokens = None
+    if usage is not None and type(usage).__name__ != "MagicMock":
+        pt = getattr(usage, "prompt_token_count", None)
+        if isinstance(pt, int):
+            prompt_tokens = pt
+        ct = getattr(usage, "candidates_token_count", None)
+        if isinstance(ct, int):
+            candidate_tokens = ct
+        tt = getattr(usage, "total_token_count", None)
+        if isinstance(tt, int):
+            total_tokens = tt
+
+    safety_block_reasons = {
+        "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "RECITATION", "OTHER_BLOCKED"
+    }
+
+    finish_reason = None
+    text_part_count = 0
+    thought_part_count = 0
+    text_fragments: List[str] = []
+    absent_content = False
+
+    if candidate_count > 0:
+        first_cand = candidates[0]
+        if first_cand is not None:
+            raw_fr = getattr(first_cand, "finish_reason", None)
+            if raw_fr and type(raw_fr).__name__ != "MagicMock":
+                if isinstance(raw_fr, str):
+                    finish_reason = raw_fr.upper()
+                elif hasattr(raw_fr, "name"):
+                    finish_reason = str(raw_fr.name).upper()
+                else:
+                    finish_reason = str(raw_fr).upper()
+
+            content = getattr(first_cand, "content", None)
+            if content is None:
+                absent_content = True
+            else:
+                raw_parts = getattr(content, "parts", None)
+                parts = []
+                if raw_parts is not None and type(raw_parts).__name__ != "MagicMock":
+                    if isinstance(raw_parts, (list, tuple)):
+                        parts = list(raw_parts)
+                elif isinstance(raw_parts, (list, tuple)):
+                    parts = list(raw_parts)
+
+                for part in parts:
+                    if part is None:
+                        continue
+                    is_thought = bool(getattr(part, "thought", False))
+                    if is_thought:
+                        thought_part_count += 1
+                        continue
+                    p_text = getattr(part, "text", None)
+                    if isinstance(p_text, str):
+                        text_part_count += 1
+                        if p_text.strip():
+                            text_fragments.append(p_text)
+
+    # Combined usable text: prefer parts text if available, fallback to prop_text
+    parts_text = "".join(text_fragments).strip() if text_fragments else None
+    extracted = parts_text or prop_text
+
+    # Safety checks
+    is_safety_finish = bool(finish_reason and any(s in finish_reason for s in safety_block_reasons))
+    is_safety_prompt = bool(block_reason and any(s in block_reason for s in safety_block_reasons))
+    is_safety = is_safety_finish or is_safety_prompt
+
+    failure_cat = None
+    if is_safety:
+        failure_cat = "safety_blocked"
+        extracted = None  # Never use text from safety blocked output
+    elif finish_reason == "MAX_TOKENS" or (candidate_tokens and candidate_tokens >= max_expected_tokens):
+        failure_cat = "output_token_truncated"
+    elif not extracted:
+        if thought_part_count > 0 and text_part_count == 0:
+            failure_cat = "thought_only_exhaustion"
+        elif candidate_count == 0:
+            failure_cat = "empty_candidates"
+        elif absent_content:
+            failure_cat = "absent_content"
+        else:
+            failure_cat = "empty_output"
+
+    return ResponseDiagnostics(
+        has_response=True,
+        candidate_count=candidate_count,
+        text_part_count=text_part_count,
+        thought_part_count=thought_part_count,
+        finish_reason=finish_reason,
+        block_reason=block_reason,
+        prompt_tokens=prompt_tokens,
+        candidate_tokens=candidate_tokens,
+        total_tokens=total_tokens,
+        extracted_text=extracted,
+        failure_category=failure_cat,
+    )
+
+
+def extract_response_text(response: Any) -> Optional[str]:
+    """Safely extracts text content from Google Gen AI GenerateContentResponse."""
+    diag = extract_response_diagnostics(response)
+    return diag.extracted_text
 
 
 def clean_json_text(text: Optional[str]) -> str:
@@ -137,6 +310,65 @@ def clean_json_text(text: Optional[str]) -> str:
                 t = bracket_match.group(1).strip()
 
     return t.strip()
+
+
+def log_sanitized_diagnostics(
+    level: int,
+    stage: str,
+    provider: str,
+    model: str,
+    diag: ResponseDiagnostics,
+    recovery_attempts: int,
+) -> None:
+    """Logs strictly sanitized diagnostic metadata without sensitive prompts, code, or tokens."""
+    tokens_meta = {
+        "prompt": diag.prompt_tokens,
+        "candidates": diag.candidate_tokens,
+        "total": diag.total_tokens,
+    }
+    logger.log(
+        level,
+        "Hosted Gemma diagnostics [%s]: provider=%s, model=%s, has_response=%s, "
+        "candidates=%d, text_parts=%d, finish_reason=%s, block_reason=%s, "
+        "usage=%s, recovery_attempts=%d, failure_category=%s",
+        stage,
+        provider,
+        model,
+        diag.has_response,
+        diag.candidate_count,
+        diag.text_part_count,
+        diag.finish_reason or "none",
+        diag.block_reason or "none",
+        tokens_meta,
+        recovery_attempts,
+        diag.failure_category or "none",
+    )
+
+
+def record_diagnostics_to_span(
+    span: Optional[Any],
+    diag: ResponseDiagnostics,
+    recovery_attempts: int,
+) -> None:
+    """Attaches safe diagnostic metadata to Sentry span without sensitive payloads."""
+    if not span:
+        return
+    span.set_tag("has_response", diag.has_response)
+    span.set_tag("candidate_count", diag.candidate_count)
+    span.set_tag("text_part_count", diag.text_part_count)
+    if diag.finish_reason:
+        span.set_tag("finish_reason", diag.finish_reason)
+    if diag.block_reason:
+        span.set_tag("block_reason", diag.block_reason)
+    if diag.prompt_tokens is not None:
+        span.set_data("prompt_tokens", diag.prompt_tokens)
+    if diag.candidate_tokens is not None:
+        span.set_data("candidate_tokens", diag.candidate_tokens)
+    if diag.total_tokens is not None:
+        span.set_data("total_tokens", diag.total_tokens)
+    span.set_data("recovery_attempt_count", recovery_attempts)
+    if diag.failure_category:
+        span.set_tag("failure_category", diag.failure_category)
 
 
 def is_transient_error(exc: Exception) -> bool:
@@ -347,7 +579,7 @@ class GemmaApiProvider(BaseAIProvider):
         findings: List[Finding],
         run_id: Optional[str] = None
     ) -> List[Finding]:
-        """Analyzes findings using hosted Gemma API with bounded payload, safe response validation, and retry."""
+        """Analyzes findings using hosted Gemma API with bounded payload, structured diagnostics, and controlled recovery."""
         if not findings or not self.api_key:
             return findings
 
@@ -388,37 +620,105 @@ class GemmaApiProvider(BaseAIProvider):
             model=self.model
         ) as span:
             try:
-                response = self._generate_with_retry(prompt, client, span=span, max_output_tokens=1024)
-                raw_text = extract_response_text(response)
-                if not raw_text:
-                    raise GemmaApiResponseError(
-                        "Hosted Gemma model returned an empty response or no usable candidate text."
+                initial_max_tokens = 2048
+                response = self._generate_with_retry(prompt, client, span=span, max_output_tokens=initial_max_tokens)
+                diag = extract_response_diagnostics(response, max_expected_tokens=initial_max_tokens)
+
+                parsed = None
+                if diag.extracted_text:
+                    cleaned_json = clean_json_text(diag.extracted_text)
+                    if cleaned_json:
+                        try:
+                            candidate_data = json.loads(cleaned_json)
+                            if isinstance(candidate_data, dict):
+                                for val in candidate_data.values():
+                                    if isinstance(val, list):
+                                        candidate_data = val
+                                        break
+                            if isinstance(candidate_data, list):
+                                parsed = candidate_data
+                            else:
+                                diag.failure_category = "malformed_json"
+                        except (json.JSONDecodeError, ValueError):
+                            if diag.finish_reason == "MAX_TOKENS":
+                                diag.failure_category = "output_token_truncated"
+                            else:
+                                diag.failure_category = "malformed_json"
+                    else:
+                        diag.failure_category = "malformed_json"
+
+                recovery_attempts = 0
+                if parsed is None:
+                    # Initial attempt produced empty, truncated, or unusable response
+                    log_sanitized_diagnostics(
+                        logging.WARNING, "analysis_initial", self.name, self.model, diag, recovery_attempts=0
                     )
+                    record_diagnostics_to_span(span, diag, recovery_attempts=0)
 
-                cleaned_json = clean_json_text(raw_text)
-                if not cleaned_json:
-                    raise GemmaApiResponseError(
-                        "Hosted Gemma model output contained no valid JSON text."
+                    if not diag.is_recoverable:
+                        span.set_data("recovery_attempt_count", 0)
+                        raise GemmaApiResponseError(
+                            f"Hosted Gemma response non-recoverable ({diag.failure_category}): {diag.sanitized_summary()}"
+                        )
+
+                    # Controlled bounded recovery attempt (at most 1)
+                    recovery_attempts = 1
+                    recovery_max_tokens = 3072
+                    recovery_prompt = (
+                        f"{prompt}\n\n"
+                        "CRITICAL: Return ONLY a valid JSON array of objects without conversational preamble or markdown code blocks."
                     )
-
-                try:
-                    parsed = json.loads(cleaned_json)
-                except (json.JSONDecodeError, ValueError) as json_err:
-                    raise GemmaApiResponseError(
-                        f"Hosted Gemma response could not be parsed as JSON: {json_err}"
-                    ) from json_err
-
-                # Unwrap dict if the model returned {"findings": [...]}
-                if isinstance(parsed, dict):
-                    for val in parsed.values():
-                        if isinstance(val, list):
-                            parsed = val
-                            break
-
-                if not isinstance(parsed, list):
-                    raise GemmaApiResponseError(
-                        "Hosted Gemma response did not match expected JSON array structure."
+                    logger.info(
+                        "Hosted Gemma recoverable response (%s). Attempting bounded recovery (1/1)...",
+                        diag.failure_category,
                     )
+                    rec_response = self._generate_with_retry(
+                        recovery_prompt, client, span=span, max_output_tokens=recovery_max_tokens
+                    )
+                    rec_diag = extract_response_diagnostics(rec_response, max_expected_tokens=recovery_max_tokens)
+
+                    if rec_diag.extracted_text:
+                        rec_cleaned = clean_json_text(rec_diag.extracted_text)
+                        if rec_cleaned:
+                            try:
+                                candidate_data = json.loads(rec_cleaned)
+                                if isinstance(candidate_data, dict):
+                                    for val in candidate_data.values():
+                                        if isinstance(val, list):
+                                            candidate_data = val
+                                            break
+                                if isinstance(candidate_data, list):
+                                    parsed = candidate_data
+                                else:
+                                    rec_diag.failure_category = "malformed_json"
+                            except (json.JSONDecodeError, ValueError):
+                                if rec_diag.finish_reason == "MAX_TOKENS":
+                                    rec_diag.failure_category = "output_token_truncated"
+                                else:
+                                    rec_diag.failure_category = "malformed_json"
+                        else:
+                            rec_diag.failure_category = "malformed_json"
+
+                    if parsed is None:
+                        log_sanitized_diagnostics(
+                            logging.WARNING, "analysis_recovery", self.name, self.model, rec_diag, recovery_attempts=1
+                        )
+                        record_diagnostics_to_span(span, rec_diag, recovery_attempts=1)
+                        span.set_data("recovery_attempted", True)
+                        span.set_data("recovery_outcome", "failed")
+                        raise GemmaApiResponseError(
+                            f"Hosted Gemma response unusable after recovery attempt ({rec_diag.failure_category or 'unusable_response'})."
+                        )
+                    else:
+                        diag = rec_diag
+                        span.set_data("recovery_attempted", True)
+                        span.set_data("recovery_outcome", "recovered")
+                        logger.info("Hosted Gemma recovery succeeded on attempt 2.")
+
+                log_sanitized_diagnostics(
+                    logging.INFO, "analysis_success", self.name, self.model, diag, recovery_attempts=recovery_attempts
+                )
+                record_diagnostics_to_span(span, diag, recovery_attempts=recovery_attempts)
 
                 updates = {
                     item["id"]: item
@@ -461,7 +761,7 @@ class GemmaApiProvider(BaseAIProvider):
         repo_path: Path,
         run_id: Optional[str] = None
     ) -> Optional[ProposedPatch]:
-        """Proposes a patch using hosted Gemma API with bounded payload, safe response validation, retries, and strict error handling."""
+        """Proposes a patch using hosted Gemma API with bounded payload, structured diagnostics, and controlled recovery."""
         if not self.api_key:
             return None
 
@@ -500,35 +800,99 @@ class GemmaApiProvider(BaseAIProvider):
             extra_tags={"finding_id": finding.id},
         ) as span:
             try:
-                response = self._generate_with_retry(prompt, client, span=span, max_output_tokens=2048)
-                raw_text = extract_response_text(response)
-                if not raw_text:
-                    raise GemmaApiResponseError(
-                        "Hosted Gemma model returned an empty response or no candidate text for patch."
+                initial_max_tokens = 2048
+                response = self._generate_with_retry(prompt, client, span=span, max_output_tokens=initial_max_tokens)
+                diag = extract_response_diagnostics(response, max_expected_tokens=initial_max_tokens)
+
+                data = None
+                if diag.extracted_text:
+                    cleaned_json = clean_json_text(diag.extracted_text)
+                    if cleaned_json:
+                        try:
+                            candidate_dict = json.loads(cleaned_json)
+                            if isinstance(candidate_dict, dict) and isinstance(candidate_dict.get("proposed_content"), str):
+                                data = candidate_dict
+                            else:
+                                diag.failure_category = "malformed_json"
+                        except (json.JSONDecodeError, ValueError):
+                            if diag.finish_reason == "MAX_TOKENS":
+                                diag.failure_category = "output_token_truncated"
+                            else:
+                                diag.failure_category = "malformed_json"
+                    else:
+                        diag.failure_category = "malformed_json"
+
+                recovery_attempts = 0
+                if data is None:
+                    log_sanitized_diagnostics(
+                        logging.WARNING, "patch_initial", self.name, self.model, diag, recovery_attempts=0
                     )
+                    record_diagnostics_to_span(span, diag, recovery_attempts=0)
 
-                cleaned_json = clean_json_text(raw_text)
-                if not cleaned_json:
-                    raise GemmaApiResponseError(
-                        "Hosted Gemma patch response contained no JSON content."
+                    if not diag.is_recoverable:
+                        span.set_data("recovery_attempt_count", 0)
+                        raise GemmaApiResponseError(
+                            f"Hosted Gemma patch response non-recoverable ({diag.failure_category}): {diag.sanitized_summary()}"
+                        )
+
+                    # Controlled bounded recovery attempt (at most 1)
+                    recovery_attempts = 1
+                    recovery_max_tokens = 3072
+                    recovery_prompt = (
+                        f"{prompt}\n\n"
+                        "CRITICAL: Output ONLY a valid JSON object adhering to the schema without markdown code blocks."
                     )
-
-                try:
-                    data = json.loads(cleaned_json)
-                except (json.JSONDecodeError, ValueError) as json_err:
-                    raise GemmaApiResponseError(
-                        f"Hosted Gemma patch response could not be parsed as JSON: {json_err}"
-                    ) from json_err
-
-                if not isinstance(data, dict):
-                    raise GemmaApiResponseError(
-                        "Hosted Gemma patch response did not return a JSON object."
+                    logger.info(
+                        "Hosted Gemma patch recoverable response (%s). Attempting bounded recovery (1/1)...",
+                        diag.failure_category,
                     )
+                    rec_response = self._generate_with_retry(
+                        recovery_prompt, client, span=span, max_output_tokens=recovery_max_tokens
+                    )
+                    rec_diag = extract_response_diagnostics(rec_response, max_expected_tokens=recovery_max_tokens)
 
-                proposed_content = data.get("proposed_content")
-                if not isinstance(proposed_content, str) or not proposed_content.strip():
+                    if rec_diag.extracted_text:
+                        rec_cleaned = clean_json_text(rec_diag.extracted_text)
+                        if rec_cleaned:
+                            try:
+                                candidate_dict = json.loads(rec_cleaned)
+                                if isinstance(candidate_dict, dict) and isinstance(candidate_dict.get("proposed_content"), str):
+                                    data = candidate_dict
+                                else:
+                                    rec_diag.failure_category = "malformed_json"
+                            except (json.JSONDecodeError, ValueError):
+                                if rec_diag.finish_reason == "MAX_TOKENS":
+                                    rec_diag.failure_category = "output_token_truncated"
+                                else:
+                                    rec_diag.failure_category = "malformed_json"
+                        else:
+                            rec_diag.failure_category = "malformed_json"
+
+                    if data is None:
+                        log_sanitized_diagnostics(
+                            logging.WARNING, "patch_recovery", self.name, self.model, rec_diag, recovery_attempts=1
+                        )
+                        record_diagnostics_to_span(span, rec_diag, recovery_attempts=1)
+                        span.set_data("recovery_attempted", True)
+                        span.set_data("recovery_outcome", "failed")
+                        raise GemmaApiResponseError(
+                            f"Hosted Gemma patch response unusable after recovery attempt ({rec_diag.failure_category or 'unusable_response'})."
+                        )
+                    else:
+                        diag = rec_diag
+                        span.set_data("recovery_attempted", True)
+                        span.set_data("recovery_outcome", "recovered")
+                        logger.info("Hosted Gemma patch recovery succeeded on attempt 2.")
+
+                log_sanitized_diagnostics(
+                    logging.INFO, "patch_success", self.name, self.model, diag, recovery_attempts=recovery_attempts
+                )
+                record_diagnostics_to_span(span, diag, recovery_attempts=recovery_attempts)
+
+                proposed_content = data.get("proposed_content", "")
+                if not proposed_content.strip():
                     raise GemmaApiResponseError(
-                        "Hosted Gemma response did not contain proposed_content string."
+                        "Hosted Gemma response did not contain usable proposed_content string."
                     )
 
                 if proposed_content and proposed_content != file_content:

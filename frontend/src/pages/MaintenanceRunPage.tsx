@@ -176,12 +176,16 @@ export const MaintenanceRunPage: React.FC<MaintenanceRunPageProps> = ({
             <div>
               <h4 className="font-semibold text-amber-200">
                 {analysisStage?.status === 'failed'
-                  ? 'Local Gemma AI Inference Timed Out or Failed'
+                  ? (currentRun?.ai_provider === 'gemma_api'
+                      ? 'Hosted Gemma AI Analysis Failed'
+                      : 'Local Gemma AI Inference Timed Out or Failed')
                   : 'Partial Gemma AI Analysis Completed'}
               </h4>
               <p className="text-amber-300/80 mt-0.5 text-[11px]">
                 {analysisStage?.details ||
-                  'Deterministic findings were preserved. AI analysis can be retried without re-scanning files.'}
+                  (currentRun?.ai_provider === 'gemma_api'
+                    ? 'Hosted Gemma response was empty or blocked. Deterministic findings were preserved.'
+                    : 'Deterministic findings were preserved. AI analysis can be retried without re-scanning files.')}
               </p>
             </div>
           </div>

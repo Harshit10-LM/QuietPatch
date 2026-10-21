@@ -116,8 +116,11 @@ export const FindingsPage: React.FC<FindingsPageProps> = ({
                 Some Findings Awaiting Gemma AI Evaluation
               </h4>
               <p className="text-amber-300/80 mt-0.5 text-[11px]">
-                Deterministic scanner findings were confirmed, but local Gemma inference timed out or was partially completed.
-                You can retry AI analysis without re-scanning repository files.
+                Deterministic scanner findings were confirmed, but{' '}
+                {currentRun.ai_provider === 'gemma_api'
+                  ? 'hosted Gemma API analysis encountered an issue or empty response'
+                  : 'local Gemma inference timed out or was partially completed'}
+                . You can retry AI analysis without re-scanning repository files.
               </p>
             </div>
           </div>
