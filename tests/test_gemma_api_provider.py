@@ -11,8 +11,11 @@ from backend.ai.agent_service import AgentService
 from backend.ai.gemma_api_provider import (
     GemmaApiError,
     GemmaApiProvider,
+    GemmaApiResponseError,
     GemmaApiTransientError,
+    clean_json_text,
     extract_error_code,
+    extract_response_text,
     is_transient_error,
     sanitize_error_message,
 )
@@ -47,10 +50,315 @@ def test_is_transient_error_detection():
     assert is_transient_error(genai_errors.APIError(429, "Rate limit exceeded")) is True
     assert is_transient_error(TimeoutError("Connection timed out")) is True
 
-    # Permanent client errors should NOT be transient
+    # Permanent client errors and deterministic response errors should NOT be transient
     assert is_transient_error(genai_errors.ClientError(401, "Invalid API key")) is False
     assert is_transient_error(genai_errors.ClientError(400, "Malformed request")) is False
     assert is_transient_error(genai_errors.ClientError(403, "Permission Denied")) is False
+    assert is_transient_error(GemmaApiResponseError("Empty response text")) is False
+    assert is_transient_error(json.JSONDecodeError("Expecting value", "", 0)) is False
+    assert is_transient_error(AttributeError("'NoneType' object has no attribute 'strip'")) is False
+
+
+def test_clean_json_text_various_formats():
+    assert clean_json_text(None) == ""
+    assert clean_json_text("") == ""
+    assert clean_json_text("   [{\"id\": 1}]   ") == "[{\"id\": 1}]"
+    assert clean_json_text("```json\n[{\"id\": 1}]\n```") == "[{\"id\": 1}]"
+    assert clean_json_text("```\n[{\"id\": 1}]\n```") == "[{\"id\": 1}]"
+    assert clean_json_text("Preamble here:\n```json\n[{\"id\": 1}]\n```\nDone") == "[{\"id\": 1}]"
+    assert clean_json_text("Here is the answer: [{\"id\": 1}] have a nice day") == "[{\"id\": 1}]"
+
+
+def test_extract_response_text_safe_handling():
+    # 1. None response
+    assert extract_response_text(None) is None
+
+    # 2. String text attribute
+    mock_resp1 = MagicMock()
+    mock_resp1.text = "  hello world  "
+    assert extract_response_text(mock_resp1) == "hello world"
+
+    # 3. None text attribute, but candidate parts have text
+    mock_resp2 = MagicMock()
+    mock_resp2.text = None
+    mock_part = MagicMock()
+    mock_part.text = "candidate part text"
+    mock_part.thought = False
+    mock_resp2.candidates = [MagicMock(content=MagicMock(parts=[mock_part]))]
+    assert extract_response_text(mock_resp2) == "candidate part text"
+
+    # 4. None text attribute, empty candidates
+    mock_resp3 = MagicMock()
+    mock_resp3.text = None
+    mock_resp3.candidates = []
+    assert extract_response_text(mock_resp3) is None
+
+    # 5. None text attribute, candidate content is None
+    mock_resp4 = MagicMock()
+    mock_resp4.text = None
+    mock_resp4.candidates = [MagicMock(content=None)]
+    assert extract_response_text(mock_resp4) is None
+
+    # 6. Candidate parts with non-string text or thought
+    mock_resp5 = MagicMock()
+    mock_resp5.text = None
+    p1 = MagicMock(text=None, thought=False)
+    p2 = MagicMock(text="internal thought", thought=True)
+    p3 = MagicMock(text="valid answer", thought=False)
+    mock_resp5.candidates = [MagicMock(content=MagicMock(parts=[p1, p2, p3]))]
+    assert extract_response_text(mock_resp5) == "valid answer"
+
+
+def test_valid_hosted_gemma_response():
+    """Verifies that a valid response from hosted Gemma properly annotates findings and generates patches."""
+    mock_client = MagicMock()
+    mock_analyze_resp = MagicMock()
+    mock_analyze_resp.text = json.dumps([
+        {
+            "id": "f-valid",
+            "severity": "high",
+            "explanation": "High severity security issue.",
+            "suggested_action": "Upgrade package immediately.",
+        }
+    ])
+    mock_patch_resp = MagicMock()
+    mock_patch_resp.text = json.dumps({
+        "change_summary": "Fix vulnerability",
+        "proposed_content": "fixed content\n",
+        "explanation": "Fix explanation",
+        "risks_assumptions": "None",
+        "suggested_verification": "pytest",
+    })
+
+    mock_client.models.generate_content.side_effect = [mock_analyze_resp, mock_patch_resp]
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-valid",
+        category=FindingCategory.CONFIGURATION,
+        title="Valid finding",
+        file_path="config.py",
+        evidence="debug=True",
+        explanation="Default explanation",
+        suggested_action="Default action",
+        severity=Severity.LOW,
+    )
+
+    # 1. Test analysis
+    analyzed = provider.analyze_and_prioritize([finding], run_id="run-valid")
+    assert len(analyzed) == 1
+    assert analyzed[0].ai_assisted is True
+    assert analyzed[0].is_demo is False
+    assert analyzed[0].severity == Severity.HIGH
+    assert analyzed[0].explanation == "High severity security issue."
+
+    # 2. Test patch generation
+    patch_res = provider.propose_patch(
+        finding=finding,
+        file_content="old content\n",
+        repo_path=Path("/tmp"),
+        run_id="run-valid",
+    )
+    assert patch_res is not None
+    assert patch_res.proposed_content == "fixed content\n"
+    assert patch_res.status == PatchStatus.PENDING
+    assert patch_res.is_demo is False
+
+
+def test_nullable_text_and_missing_response_content():
+    """Verifies that response.text=None does not raise AttributeError and reports honest failure."""
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.text = None
+    mock_resp.candidates = None
+    mock_client.models.generate_content.return_value = mock_resp
+
+    provider = GemmaApiProvider(api_key="test-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-null",
+        category=FindingCategory.CONFIGURATION,
+        title="Null text test",
+        file_path="app.py",
+        evidence="evidence",
+        explanation="Orig explanation",
+        suggested_action="Orig action",
+        severity=Severity.LOW,
+    )
+
+    # Must NOT raise AttributeError: 'NoneType' object has no attribute 'strip'
+    analyzed = provider.analyze_and_prioritize([finding], run_id="run-null-text")
+    assert analyzed[0].ai_assisted is False
+    assert analyzed[0].is_demo is False
+
+    patch_res = provider.propose_patch(
+        finding=finding,
+        file_content="test\n",
+        repo_path=Path("/tmp"),
+        run_id="run-null-text",
+    )
+    assert patch_res is None
+
+
+def test_empty_candidates_or_missing_candidate_text():
+    """Verifies that empty candidates or candidates with None content/parts do not crash."""
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.text = None
+    mock_resp.candidates = [MagicMock(content=MagicMock(parts=[]))]
+    mock_client.models.generate_content.return_value = mock_resp
+
+    provider = GemmaApiProvider(api_key="test-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-empty-cand",
+        category=FindingCategory.DOCUMENTATION,
+        title="Empty candidate test",
+        file_path="README.md",
+        evidence="broken",
+        explanation="Doc explanation",
+        suggested_action="Fix doc",
+        severity=Severity.LOW,
+    )
+
+    analyzed = provider.analyze_and_prioritize([finding], run_id="run-empty-cand")
+    assert analyzed[0].ai_assisted is False
+    assert analyzed[0].is_demo is False
+
+    patch_res = provider.propose_patch(
+        finding=finding,
+        file_content="# README\n",
+        repo_path=Path("/tmp"),
+        run_id="run-empty-cand",
+    )
+    assert patch_res is None
+
+
+def test_malformed_json_and_unexpected_response_structures():
+    """Verifies that malformed JSON or unexpected non-list/non-dict outputs fail safely without crash."""
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.text = "This is plain unstructured prose without valid JSON syntax {unclosed"
+    mock_client.models.generate_content.return_value = mock_resp
+
+    provider = GemmaApiProvider(api_key="test-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-malformed",
+        category=FindingCategory.CONFIGURATION,
+        title="Malformed JSON test",
+        file_path="settings.py",
+        evidence="settings",
+        explanation="Settings explanation",
+        suggested_action="Fix settings",
+        severity=Severity.LOW,
+    )
+
+    analyzed = provider.analyze_and_prioritize([finding], run_id="run-malformed")
+    assert analyzed[0].ai_assisted is False
+    assert analyzed[0].is_demo is False
+
+    # Also test unexpected JSON structure (dict when expecting list of findings)
+    mock_resp.text = json.dumps({"status": "no findings array here"})
+    analyzed_dict = provider.analyze_and_prioritize([finding], run_id="run-unexpected")
+    assert analyzed_dict[0].ai_assisted is False
+
+    # In patch generation, test malformed response
+    mock_resp.text = json.dumps(["not a dict"])
+    patch_res = provider.propose_patch(
+        finding=finding,
+        file_content="old\n",
+        repo_path=Path("/tmp"),
+        run_id="run-malformed-patch",
+    )
+    assert patch_res is None
+
+
+def test_successful_http_response_followed_by_processing_failure_is_not_retried():
+    """Verifies that when HTTP is 200 but content is invalid, it is NOT retried like a transient 500."""
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.text = None
+    mock_resp.candidates = []
+    mock_client.models.generate_content.return_value = mock_resp
+
+    provider = GemmaApiProvider(
+        api_key="test-key",
+        model="gemma-4-26b-a4b-it",
+        max_retries=3,
+        backoff_factor=0.001,
+    )
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-single-call",
+        category=FindingCategory.CONFIGURATION,
+        title="Single call test",
+        file_path="config.py",
+        evidence="evidence",
+        explanation="Explanation",
+        suggested_action="Action",
+        severity=Severity.LOW,
+    )
+
+    provider.analyze_and_prioritize([finding], run_id="run-no-retry-parse")
+    # Must only be called ONCE (deterministic parsing error, NOT retried 3 times)
+    assert mock_client.models.generate_content.call_count == 1
+
+
+def test_honest_failure_reporting_no_false_badges_no_demo_fallback(tmp_path):
+    """Verifies that when hosted Gemma analysis fails, no demo fallback is used and proposal is skipped."""
+    mock_provider = MagicMock()
+    mock_provider.name = "gemma_api"
+    mock_provider.model = "gemma-4-26b-a4b-it"
+
+    # Hosted Gemma analysis fails because response has no usable text
+    def mock_analyze_fail(findings, run_id=None):
+        # Returns findings unmodified
+        return findings
+
+    mock_provider.analyze_and_prioritize.side_effect = mock_analyze_fail
+
+    agent = AgentService(provider_name="gemma_api")
+    agent.provider = mock_provider
+
+    f1 = tmp_path / "app.py"
+    f1.write_text("import sys\n", encoding="utf-8")
+
+    finding = Finding(
+        id="f-no-demo",
+        category=FindingCategory.CONFIGURATION,
+        title="Test finding",
+        file_path="app.py",
+        evidence="import sys",
+        explanation="Sys import",
+        suggested_action="Check import",
+        severity=Severity.LOW,
+    )
+
+    with patch.object(agent.scan_engine, "discover_files", return_value=([f1], 10)), \
+         patch.object(agent.scan_engine, "run_scanners", return_value=([finding], {})):
+
+        run = agent.execute_maintenance_run(
+            repo_path=tmp_path,
+            repo_name="NoDemoRepo",
+            repo_type="local",
+            run_id="run-no-demo",
+        )
+
+    # Analysis failed
+    assert run.stages["analysis"].status == "failed"
+    # Patch synthesis skipped because analysis was unavailable
+    assert run.stages["proposal"].status == "skipped"
+    assert len(run.patches) == 0
+    # Findings must NOT have false AI badges or demo badges
+    assert finding.ai_assisted is False
+    assert finding.is_demo is False
 
 
 def test_transient_500_retry_success():

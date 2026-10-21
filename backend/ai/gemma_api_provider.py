@@ -39,6 +39,11 @@ class GemmaApiTransientError(GemmaApiError):
     pass
 
 
+class GemmaApiResponseError(GemmaApiError):
+    """Deterministic model response error (empty response, missing candidate text, malformed JSON)."""
+    pass
+
+
 def sanitize_error_message(msg: str) -> str:
     """Sanitizes raw error message by scrubbing API keys, local paths, and private details."""
     if not msg:
@@ -58,8 +63,88 @@ def sanitize_error_message(msg: str) -> str:
     return cleaned.strip()
 
 
+def extract_response_text(response: Any) -> Optional[str]:
+    """Safely extracts text content from Google Gen AI GenerateContentResponse.
+
+    Validates:
+    - response is not None
+    - response.text property (if string and non-empty)
+    - response.candidates list availability
+    - candidate.content presence
+    - content.parts iteration, handling parts with None or non-string text
+    - ignores internal thought/reasoning parts
+    """
+    if response is None:
+        return None
+
+    # 1. Primary check: response.text attribute (guarded against AttributeError)
+    try:
+        raw_text = getattr(response, "text", None)
+        if isinstance(raw_text, str) and raw_text.strip():
+            return raw_text.strip()
+    except Exception:
+        pass
+
+    # 2. Structural fallback: inspect candidates[0].content.parts directly
+    try:
+        candidates = getattr(response, "candidates", None)
+        if candidates and isinstance(candidates, (list, tuple)) and len(candidates) > 0:
+            first_cand = candidates[0]
+            if first_cand is not None:
+                content = getattr(first_cand, "content", None)
+                if content is not None:
+                    parts = getattr(content, "parts", None)
+                    if parts and isinstance(parts, (list, tuple)):
+                        text_fragments = []
+                        for part in parts:
+                            if part is None:
+                                continue
+                            if getattr(part, "thought", False):
+                                continue
+                            p_text = getattr(part, "text", None)
+                            if isinstance(p_text, str) and p_text:
+                                text_fragments.append(p_text)
+                        if text_fragments:
+                            combined = "".join(text_fragments).strip()
+                            if combined:
+                                return combined
+    except Exception:
+        pass
+
+    return None
+
+
+def clean_json_text(text: Optional[str]) -> str:
+    """Safely strips markdown code fences, preamble, and whitespace from model JSON output."""
+    if not text or not isinstance(text, str):
+        return ""
+
+    t = text.strip()
+
+    # Strip direct ```json ... ``` code fences
+    if t.startswith("```"):
+        t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+        t = re.sub(r"\s*```$", "", t)
+    else:
+        # Search for embedded markdown code blocks
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", t, flags=re.IGNORECASE)
+        if fence_match:
+            t = fence_match.group(1).strip()
+        else:
+            # Fallback: search for top-level JSON array [...] or object {...}
+            bracket_match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", t)
+            if bracket_match:
+                t = bracket_match.group(1).strip()
+
+    return t.strip()
+
+
 def is_transient_error(exc: Exception) -> bool:
     """Identifies transient upstream errors eligible for bounded retry."""
+    # Deterministic response errors and parsing exceptions must NEVER be retried
+    if isinstance(exc, (GemmaApiResponseError, json.JSONDecodeError, ValueError, AttributeError, TypeError)):
+        return False
+
     # Check for google.genai errors
     try:
         from google.genai import errors as genai_errors
@@ -262,7 +347,7 @@ class GemmaApiProvider(BaseAIProvider):
         findings: List[Finding],
         run_id: Optional[str] = None
     ) -> List[Finding]:
-        """Analyzes findings using hosted Gemma API with bounded payload and retry."""
+        """Analyzes findings using hosted Gemma API with bounded payload, safe response validation, and retry."""
         if not findings or not self.api_key:
             return findings
 
@@ -304,33 +389,63 @@ class GemmaApiProvider(BaseAIProvider):
         ) as span:
             try:
                 response = self._generate_with_retry(prompt, client, span=span, max_output_tokens=1024)
-                text = response.text.strip()
-                if text.startswith("```"):
-                    text = text.strip("`").replace("json\n", "", 1).strip()
-                parsed = json.loads(text)
-                if isinstance(parsed, list):
-                    updates = {item["id"]: item for item in parsed if isinstance(item, dict) and "id" in item}
-                    for f in findings:
-                        if f.id in updates:
-                            u = updates[f.id]
-                            if "severity" in u and u["severity"] in Severity._value2member_map_:
-                                f.severity = Severity(u["severity"])
-                            if "explanation" in u and isinstance(u["explanation"], str):
-                                f.explanation = u["explanation"]
-                            if "suggested_action" in u and isinstance(u["suggested_action"], str):
-                                f.suggested_action = u["suggested_action"]
-                            f.ai_assisted = True
-                            f.is_demo = False
-                            f.ai_model = self.model
+                raw_text = extract_response_text(response)
+                if not raw_text:
+                    raise GemmaApiResponseError(
+                        "Hosted Gemma model returned an empty response or no usable candidate text."
+                    )
 
-                    evaluated_count = sum(1 for f in findings if f.ai_assisted)
-                    if evaluated_count > 0:
-                        span.set_outcome("completed")
-                        span.set_tag("findings_count", evaluated_count)
-                    else:
-                        span.set_outcome("failed", details="Zero findings evaluated from model response")
+                cleaned_json = clean_json_text(raw_text)
+                if not cleaned_json:
+                    raise GemmaApiResponseError(
+                        "Hosted Gemma model output contained no valid JSON text."
+                    )
+
+                try:
+                    parsed = json.loads(cleaned_json)
+                except (json.JSONDecodeError, ValueError) as json_err:
+                    raise GemmaApiResponseError(
+                        f"Hosted Gemma response could not be parsed as JSON: {json_err}"
+                    ) from json_err
+
+                # Unwrap dict if the model returned {"findings": [...]}
+                if isinstance(parsed, dict):
+                    for val in parsed.values():
+                        if isinstance(val, list):
+                            parsed = val
+                            break
+
+                if not isinstance(parsed, list):
+                    raise GemmaApiResponseError(
+                        "Hosted Gemma response did not match expected JSON array structure."
+                    )
+
+                updates = {
+                    item["id"]: item
+                    for item in parsed
+                    if isinstance(item, dict) and "id" in item
+                }
+                for f in findings:
+                    if f.id in updates:
+                        u = updates[f.id]
+                        if "severity" in u and u["severity"] in Severity._value2member_map_:
+                            f.severity = Severity(u["severity"])
+                        if "explanation" in u and isinstance(u["explanation"], str) and u["explanation"].strip():
+                            f.explanation = u["explanation"].strip()
+                        if "suggested_action" in u and isinstance(u["suggested_action"], str) and u["suggested_action"].strip():
+                            f.suggested_action = u["suggested_action"].strip()
+                        f.ai_assisted = True
+                        f.is_demo = False
+                        f.ai_model = self.model
+
+                evaluated_count = sum(1 for f in findings if f.ai_assisted)
+                if evaluated_count > 0:
+                    span.set_outcome("completed")
+                    span.set_tag("findings_count", evaluated_count)
                 else:
-                    span.set_outcome("failed", details="Model response was not a JSON list")
+                    raise GemmaApiResponseError(
+                        "Zero findings could be matched and evaluated from model response."
+                    )
             except Exception as e:
                 sanitized_err = sanitize_error_message(str(e))
                 logger.warning("Hosted Gemma analysis failed: %s", sanitized_err)
@@ -346,7 +461,7 @@ class GemmaApiProvider(BaseAIProvider):
         repo_path: Path,
         run_id: Optional[str] = None
     ) -> Optional[ProposedPatch]:
-        """Proposes a patch using hosted Gemma API with bounded payload, retries, and strict error handling."""
+        """Proposes a patch using hosted Gemma API with bounded payload, safe response validation, retries, and strict error handling."""
         if not self.api_key:
             return None
 
@@ -386,11 +501,36 @@ class GemmaApiProvider(BaseAIProvider):
         ) as span:
             try:
                 response = self._generate_with_retry(prompt, client, span=span, max_output_tokens=2048)
-                text = response.text.strip()
-                if text.startswith("```"):
-                    text = text.strip("`").replace("json\n", "", 1).strip()
-                data = json.loads(text)
-                proposed_content = data.get("proposed_content", "")
+                raw_text = extract_response_text(response)
+                if not raw_text:
+                    raise GemmaApiResponseError(
+                        "Hosted Gemma model returned an empty response or no candidate text for patch."
+                    )
+
+                cleaned_json = clean_json_text(raw_text)
+                if not cleaned_json:
+                    raise GemmaApiResponseError(
+                        "Hosted Gemma patch response contained no JSON content."
+                    )
+
+                try:
+                    data = json.loads(cleaned_json)
+                except (json.JSONDecodeError, ValueError) as json_err:
+                    raise GemmaApiResponseError(
+                        f"Hosted Gemma patch response could not be parsed as JSON: {json_err}"
+                    ) from json_err
+
+                if not isinstance(data, dict):
+                    raise GemmaApiResponseError(
+                        "Hosted Gemma patch response did not return a JSON object."
+                    )
+
+                proposed_content = data.get("proposed_content")
+                if not isinstance(proposed_content, str) or not proposed_content.strip():
+                    raise GemmaApiResponseError(
+                        "Hosted Gemma response did not contain proposed_content string."
+                    )
+
                 if proposed_content and proposed_content != file_content:
                     diff_lines = list(difflib.unified_diff(
                         file_content.splitlines(keepends=True),
@@ -398,6 +538,11 @@ class GemmaApiProvider(BaseAIProvider):
                         fromfile=f"a/{finding.file_path}",
                         tofile=f"b/{finding.file_path}",
                     ))
+                    if not diff_lines:
+                        raise GemmaApiResponseError(
+                            "Model proposed_content produced an empty unified diff."
+                        )
+
                     patch = ProposedPatch(
                         id=f"patch-{finding.id}",
                         finding_id=finding.id,
@@ -417,7 +562,7 @@ class GemmaApiProvider(BaseAIProvider):
                     span.set_tag("patches_count", 1)
                     return patch
                 else:
-                    span.set_outcome("failed", details="Model response contained no patch diff")
+                    span.set_outcome("failed", details="Model proposed_content was identical to original")
                     return None
             except Exception as e:
                 sanitized_err = sanitize_error_message(str(e))
