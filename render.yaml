@@ -10,7 +10,7 @@ services:
       - key: APP_MODE
         value: hosted
       - key: AI_PROVIDER
-        value: demo
+        value: gemma_api
       - key: GEMMA_API_MODEL
         value: gemma-4-26b-a4b-it
       - key: GEMMA_API_KEY
