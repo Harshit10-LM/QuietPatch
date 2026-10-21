@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: quietpatch
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /api/health
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: APP_MODE
+        value: hosted
+      - key: AI_PROVIDER
+        value: demo
+      - key: GEMMA_API_MODEL
+        value: gemma-4-26b-a4b-it
+      - key: GEMMA_API_KEY
+        sync: false
+      - key: SENTRY_DSN
+        sync: false
+      - key: SENTRY_TRACES_SAMPLE_RATE
+        value: "0.1"
+      - key: SENTRY_ENVIRONMENT
+        value: production
+      - key: MAX_REPO_FILES
+        value: "500"
+      - key: MAX_REPO_BYTES
+        value: "10485760"
+      - key: MAX_SCAN_SECONDS
+        value: "60"

@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Node & Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.tmp/
+.npm
+.eslintcache
+
+# QuietPatch Backups & Local Data
+.quietpatch/backups/
+*.qp_tmp
+*.bak
+
+# Environment variables & secrets
+.env
+.env.local
+*.secret
+credentials.json
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Environment-specific configuration variants
+.env.*
+!.env.example
+
+# Private keys
+*.pem
+*.key
+id_rsa
+id_ed25519

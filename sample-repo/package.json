@@ -1,0 +1,12 @@
+{
+  "name": "novatask-client",
+  "version": "0.1.0",
+  "description": "Client SDK for NovaTask asynchronous orchestration",
+  "main": "index.js",
+  "scripts": {
+    "build": "echo 'building client'",
+    "lint": "echo 'linting client'"
+  },
+  "keywords": ["task", "queue", "orchestration"],
+  "license": "ISC"
+}
