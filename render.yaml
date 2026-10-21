@@ -2,7 +2,7 @@ services:
   - type: web
     name: quietpatch
     runtime: docker
-    plan: free
+    plan: starter
     region: oregon
     healthCheckPath: /api/health
     dockerfilePath: Dockerfile
