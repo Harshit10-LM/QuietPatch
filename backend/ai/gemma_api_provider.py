@@ -620,7 +620,7 @@ class GemmaApiProvider(BaseAIProvider):
             model=self.model
         ) as span:
             try:
-                initial_max_tokens = 2048
+                initial_max_tokens = Config.GEMMA_API_MAX_OUTPUT_TOKENS
                 response = self._generate_with_retry(prompt, client, span=span, max_output_tokens=initial_max_tokens)
                 diag = extract_response_diagnostics(response, max_expected_tokens=initial_max_tokens)
 
@@ -663,11 +663,20 @@ class GemmaApiProvider(BaseAIProvider):
 
                     # Controlled bounded recovery attempt (at most 1)
                     recovery_attempts = 1
-                    recovery_max_tokens = 3072
-                    recovery_prompt = (
-                        f"{prompt}\n\n"
-                        "CRITICAL: Return ONLY a valid JSON array of objects without conversational preamble or markdown code blocks."
-                    )
+                    recovery_max_tokens = Config.GEMMA_API_RECOVERY_MAX_TOKENS
+                    if diag.failure_category == "output_token_truncated":
+                        reduced_payload = findings_payload[:3]
+                        recovery_prompt = (
+                            f"{SYSTEM_INSTRUCTION}\n"
+                            f"Previous response was truncated. Review this reduced subset of {len(reduced_payload)} findings concisely:\n"
+                            f"{json.dumps(reduced_payload, indent=2)}\n\n"
+                            f"Return ONLY a valid JSON array of objects without conversational preamble or markdown code blocks."
+                        )
+                    else:
+                        recovery_prompt = (
+                            f"{prompt}\n\n"
+                            "CRITICAL: Return ONLY a valid JSON array of objects without conversational preamble or markdown code blocks."
+                        )
                     logger.info(
                         "Hosted Gemma recoverable response (%s). Attempting bounded recovery (1/1)...",
                         diag.failure_category,
@@ -800,7 +809,7 @@ class GemmaApiProvider(BaseAIProvider):
             extra_tags={"finding_id": finding.id},
         ) as span:
             try:
-                initial_max_tokens = 2048
+                initial_max_tokens = Config.GEMMA_API_MAX_OUTPUT_TOKENS
                 response = self._generate_with_retry(prompt, client, span=span, max_output_tokens=initial_max_tokens)
                 diag = extract_response_diagnostics(response, max_expected_tokens=initial_max_tokens)
 
@@ -837,11 +846,31 @@ class GemmaApiProvider(BaseAIProvider):
 
                     # Controlled bounded recovery attempt (at most 1)
                     recovery_attempts = 1
-                    recovery_max_tokens = 3072
-                    recovery_prompt = (
-                        f"{prompt}\n\n"
-                        "CRITICAL: Output ONLY a valid JSON object adhering to the schema without markdown code blocks."
-                    )
+                    recovery_max_tokens = Config.GEMMA_API_RECOVERY_MAX_TOKENS
+                    if diag.failure_category == "output_token_truncated":
+                        reduced_content = self._bound_file_content(file_content, finding, max_chars=800)
+                        recovery_prompt = (
+                            f"{SYSTEM_INSTRUCTION}\n"
+                            f"The previous patch generation was truncated due to token budget limits.\n"
+                            f"Propose a concise, minimal fix strictly for this finding without unnecessary whitespace or changes:\n"
+                            f"Finding: {finding.title[:150]}\n"
+                            f"File: {finding.file_path}\n"
+                            f"Evidence: {bounded_evidence[:150]}\n\n"
+                            f"Relevant file snippet:\n```\n{reduced_content}\n```\n\n"
+                            f"Return ONLY valid JSON matching this schema:\n"
+                            f"{{\n"
+                            f'  "change_summary": "1 concise sentence describing fix",\n'
+                            f'  "proposed_content": "updated complete file text with fix applied",\n'
+                            f'  "explanation": "concise explanation",\n'
+                            f'  "risks_assumptions": "minimal risks",\n'
+                            f'  "suggested_verification": "how to verify"\n'
+                            f"}}"
+                        )
+                    else:
+                        recovery_prompt = (
+                            f"{prompt}\n\n"
+                            "CRITICAL: Output ONLY a valid JSON object adhering to the schema without markdown code blocks."
+                        )
                     logger.info(
                         "Hosted Gemma patch recoverable response (%s). Attempting bounded recovery (1/1)...",
                         diag.failure_category,

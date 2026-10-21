@@ -39,6 +39,14 @@ class Config:
         GEMMA_API_BACKOFF_FACTOR = float(os.getenv("GEMMA_API_BACKOFF_FACTOR", "0.5"))
     except ValueError:
         GEMMA_API_BACKOFF_FACTOR = 0.5
+    try:
+        GEMMA_API_MAX_OUTPUT_TOKENS = int(os.getenv("GEMMA_API_MAX_OUTPUT_TOKENS", "2048"))
+    except ValueError:
+        GEMMA_API_MAX_OUTPUT_TOKENS = 2048
+    try:
+        GEMMA_API_RECOVERY_MAX_TOKENS = int(os.getenv("GEMMA_API_RECOVERY_MAX_TOKENS", "3072"))
+    except ValueError:
+        GEMMA_API_RECOVERY_MAX_TOKENS = 3072
 
     # Security Boundaries
     default_allowed_root = str(BASE_DIR.resolve())
@@ -78,6 +86,8 @@ class Config:
             "has_gemma_api_key": bool(cls.GEMMA_API_KEY),
             "gemma_api_max_retries": cls.GEMMA_API_MAX_RETRIES,
             "gemma_api_backoff_factor": cls.GEMMA_API_BACKOFF_FACTOR,
+            "gemma_api_max_output_tokens": cls.GEMMA_API_MAX_OUTPUT_TOKENS,
+            "gemma_api_recovery_max_tokens": cls.GEMMA_API_RECOVERY_MAX_TOKENS,
             "allowed_root": str(cls.QUIETPATCH_ALLOWED_ROOT),
             "sentry_configured": bool(cls.SENTRY_DSN),
             "sentry_environment": cls.SENTRY_ENVIRONMENT,

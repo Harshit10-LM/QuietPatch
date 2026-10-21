@@ -78,6 +78,7 @@ class AgentService:
         repo_name: str,
         repo_type: str = "local",
         run_id: Optional[str] = None,
+        existing_run: Optional[MaintenanceRun] = None,
     ) -> MaintenanceRun:
         """Executes the full 8-stage caretaker workflow inside a root Sentry transaction:
 
@@ -90,27 +91,51 @@ class AgentService:
         7. quietpatch.verification
         8. quietpatch.report_generation
         """
-        run_id = run_id or f"run-{uuid.uuid4().hex[:8]}"
+        run_id = existing_run.id if existing_run else (run_id or f"run-{uuid.uuid4().hex[:8]}")
         start_time = time.time()
         model_name = getattr(self.provider, "model", "demonstration")
 
-        run = MaintenanceRun(
-            id=run_id,
-            repository_name=repo_name,
-            repository_path=str(repo_path),
-            repository_type=repo_type,
-            status="discovering",
-            ai_provider=self.provider_name,
-            ai_model=model_name,
-        )
+        if existing_run:
+            run = existing_run
+            run.status = "discovering"
+            run.ai_provider = self.provider_name
+            run.ai_model = model_name
+        else:
+            run = MaintenanceRun(
+                id=run_id,
+                repository_name=repo_name,
+                repository_path=str(repo_path),
+                repository_type=repo_type,
+                status="discovering",
+                ai_provider=self.provider_name,
+                ai_model=model_name,
+            )
+
+        def set_stage_running(name: str, details: Optional[str] = None):
+            started = datetime.now(timezone.utc).isoformat()
+            if name in run.stages:
+                run.stages[name].status = "running"
+                if not run.stages[name].started_at:
+                    run.stages[name].started_at = started
+                if details:
+                    run.stages[name].details = details
+            else:
+                run.stages[name] = StageRecord(
+                    name=name,
+                    status="running",
+                    started_at=started,
+                    details=details,
+                )
 
         def record_stage(name: str, status: str, duration: float = 0.0, details: Optional[str] = None):
+            started = run.stages[name].started_at if name in run.stages else None
             run.stages[name] = StageRecord(
                 name=name,
                 status=status,
                 duration_seconds=round(duration, 3),
                 details=details,
-                completed_at=datetime.now(timezone.utc).isoformat() if status == "completed" else None,
+                started_at=started,
+                completed_at=datetime.now(timezone.utc).isoformat() if status in {"completed", "partial", "failed", "skipped"} else None,
             )
 
         with maintenance_run_trace(
@@ -122,6 +147,8 @@ class AgentService:
         ) as run_tracer:
             try:
                 # Stage 1: quietpatch.initialize
+                run.status = "discovering"
+                set_stage_running("initialization")
                 with agent_stage_span(
                     "Scan-run Initialization",
                     op="quietpatch.initialize",
@@ -140,6 +167,7 @@ class AgentService:
 
                 # Stage 2: quietpatch.repository_discovery
                 run.status = "discovering"
+                set_stage_running("discovery")
                 with agent_stage_span(
                     "Repository Discovery",
                     op="quietpatch.repository_discovery",
@@ -158,6 +186,7 @@ class AgentService:
                 # Stage 3: quietpatch.deterministic_scan
                 run.status = "scanning"
                 run.files_scanned = len(discovered_files)
+                set_stage_running("scan")
                 with agent_stage_span(
                     "Deterministic Scanner Suite",
                     op="quietpatch.deterministic_scan",
@@ -183,6 +212,7 @@ class AgentService:
 
                 # Stage 4: quietpatch.gemma_analysis
                 run.status = "analyzing"
+                set_stage_running("analysis")
                 t_analyze = time.time()
                 analysis_succeeded = False
 
@@ -229,16 +259,19 @@ class AgentService:
                     except Exception as ai_err:
                         analyze_duration = round(time.time() - t_analyze, 3)
                         logger.warning("AI analysis failed in stage 'analysis': %s", ai_err)
-                        analysis_span.set_outcome("failed", details=str(ai_err))
+                        from backend.ai.gemma_api_provider import sanitize_error_message
+                        sanitized_ai_err = sanitize_error_message(str(ai_err))
+                        analysis_span.set_outcome("failed", details=sanitized_ai_err)
                         record_stage(
                             "analysis",
                             "failed",
                             analyze_duration,
-                            f"AI analysis failed ({type(ai_err).__name__}): {ai_err}",
+                            f"AI analysis failed ({type(ai_err).__name__}): {sanitized_ai_err}",
                         )
 
                 # Stage 5: quietpatch.prioritization
                 run.status = "prioritizing"
+                set_stage_running("prioritization")
                 with agent_stage_span(
                     "Finding Prioritization",
                     op="quietpatch.prioritization",
@@ -260,8 +293,10 @@ class AgentService:
 
                 # Stage 6: quietpatch.patch_generation
                 run.status = "proposing"
+                set_stage_running("proposal")
                 t_prop = time.time()
-                patches: List[ProposedPatch] = []
+                patches: List[ProposedPatch] = list(run.patches)
+                existing_patch_finding_ids = {p.finding_id for p in patches}
 
                 with agent_stage_span(
                     "Reviewable Patch Synthesis",
@@ -285,20 +320,31 @@ class AgentService:
                         eligible_findings = [
                             f for f in run.findings
                             if f.category.value in {"configuration", "documentation", "general", "javascript"}
+                            and f.id not in existing_patch_finding_ids
                         ][:3]
 
                         if not eligible_findings:
                             prop_duration = round(time.time() - t_prop, 3)
-                            patch_span.set_outcome("skipped", details="No eligible findings for patch proposal")
-                            record_stage(
-                                "proposal",
-                                "skipped",
-                                prop_duration,
-                                "No eligible findings for automated patch proposal",
-                            )
+                            if len(patches) > 0:
+                                patch_span.set_outcome("completed")
+                                record_stage(
+                                    "proposal",
+                                    "completed",
+                                    prop_duration,
+                                    f"Preserved {len(patches)} reviewable patches",
+                                )
+                            else:
+                                patch_span.set_outcome("skipped", details="No eligible findings for patch proposal")
+                                record_stage(
+                                    "proposal",
+                                    "skipped",
+                                    prop_duration,
+                                    "No eligible findings for automated patch proposal",
+                                )
                         else:
                             attempted_count = len(eligible_findings)
                             failed_count = 0
+                            new_patches_count = 0
                             for finding in eligible_findings:
                                 target_file = repo_path / finding.file_path
                                 file_content = ""
@@ -313,6 +359,8 @@ class AgentService:
                                     patch = self.provider.propose_patch(finding, file_content, repo_path, run_id=run_id)
                                     if patch and patch.diff:
                                         patches.append(patch)
+                                        run.patches = list(patches)
+                                        new_patches_count += 1
                                     else:
                                         failed_count += 1
                                 except Exception as patch_err:
@@ -325,7 +373,7 @@ class AgentService:
                             patch_span.set_tag("attempted_count", attempted_count)
                             patch_span.set_tag("failed_count", failed_count)
 
-                            if len(patches) == attempted_count:
+                            if new_patches_count == attempted_count:
                                 patch_span.set_outcome("completed")
                                 record_stage(
                                     "proposal",
@@ -333,7 +381,7 @@ class AgentService:
                                     prop_duration,
                                     f"Proposed {len(patches)} reviewable patches",
                                 )
-                            elif len(patches) > 0:
+                            elif new_patches_count > 0:
                                 patch_span.set_outcome(
                                     "partial",
                                     details=f"Proposed {len(patches)}/{attempted_count} patches ({failed_count} failed)",
@@ -357,6 +405,8 @@ class AgentService:
                                 )
 
                 # Stage 7: quietpatch.verification
+                run.status = "verifying"
+                set_stage_running("verification")
                 with agent_stage_span(
                     "Deterministic Verification",
                     op="quietpatch.verification",
@@ -378,6 +428,8 @@ class AgentService:
                     )
 
                 # Stage 8: quietpatch.report_generation
+                run.status = "reporting"
+                set_stage_running("report")
                 with agent_stage_span(
                     "Report Generation",
                     op="quietpatch.report_generation",
@@ -414,9 +466,10 @@ class AgentService:
             except Exception as exc:
                 logger.error("Maintenance run failed: %s", exc, exc_info=True)
                 run.status = "failed"
-                run.error = str(exc)
+                from backend.ai.gemma_api_provider import sanitize_error_message
+                run.error = sanitize_error_message(str(exc))
                 run.duration_seconds = round(time.time() - start_time, 3)
-                record_stage("workflow", "failed", run.duration_seconds, str(exc))
+                record_stage("workflow", "failed", run.duration_seconds, run.error)
                 run_tracer.set_status("internal_error")
 
         return run
@@ -486,15 +539,19 @@ class AgentService:
                 except Exception as ai_err:
                     analyze_duration = round(time.time() - t_analyze, 3)
                     logger.warning("Retry AI analysis failed: %s", ai_err)
-                    analysis_span.set_outcome("failed", details=str(ai_err))
+                    from backend.ai.gemma_api_provider import sanitize_error_message
+                    sanitized_ai_err = sanitize_error_message(str(ai_err))
+                    analysis_span.set_outcome("failed", details=sanitized_ai_err)
                     run.stages["analysis"] = StageRecord(
                         name="analysis",
                         status="failed",
                         duration_seconds=analyze_duration,
-                        details=f"AI analysis retry failed: {ai_err}",
+                        details=f"AI analysis retry failed: {sanitized_ai_err}",
+                        completed_at=datetime.now(timezone.utc).isoformat(),
                     )
 
             # Stage 5: quietpatch.prioritization
+            run.status = "prioritizing"
             with agent_stage_span(
                 "Finding Prioritization",
                 op="quietpatch.prioritization",
@@ -505,9 +562,17 @@ class AgentService:
             ) as prio_span:
                 self.prioritize_findings(run.findings)
                 prio_span.set_outcome("completed")
+                run.stages["prioritization"] = StageRecord(
+                    name="prioritization",
+                    status="completed",
+                    duration_seconds=0.1,
+                    details=f"Calibrated priority order for {len(run.findings)} findings (retry)",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
 
             # Stage 6: quietpatch.patch_generation
-            if analysis_succeeded and len(run.patches) == 0:
+            run.status = "proposing"
+            if analysis_succeeded:
                 with agent_stage_span(
                     "Reviewable Patch Synthesis",
                     op="quietpatch.patch_generation",
@@ -516,13 +581,16 @@ class AgentService:
                     model=run.ai_model,
                 ) as patch_span:
                     repo_path = Path(run.repository_path)
+                    patches: List[ProposedPatch] = list(run.patches)
+                    existing_patch_finding_ids = {p.finding_id for p in patches}
                     eligible_findings = [
                         f for f in run.findings
                         if f.category.value in {"configuration", "documentation", "general", "javascript"}
+                        and f.id not in existing_patch_finding_ids
                     ][:3]
-                    patches: List[ProposedPatch] = []
                     failed_count = 0
                     attempted_count = len(eligible_findings)
+                    new_patches_count = 0
 
                     for finding in eligible_findings:
                         target_file = repo_path / finding.file_path
@@ -537,6 +605,8 @@ class AgentService:
                             patch = self.provider.propose_patch(finding, file_content, repo_path, run_id=run.id)
                             if patch and patch.diff:
                                 patches.append(patch)
+                                run.patches = list(patches)
+                                new_patches_count += 1
                             else:
                                 failed_count += 1
                         except Exception as patch_err:
@@ -549,31 +619,34 @@ class AgentService:
                     patch_span.set_tag("failed_count", failed_count)
 
                     if attempted_count == 0:
-                        patch_span.set_outcome("skipped", details="No eligible findings")
+                        patch_span.set_outcome("completed" if len(patches) > 0 else "skipped")
                         run.stages["proposal"] = StageRecord(
                             name="proposal",
-                            status="skipped",
+                            status="completed" if len(patches) > 0 else "skipped",
                             duration_seconds=0.1,
-                            details="No eligible findings for patch proposal",
+                            details=f"Preserved {len(patches)} reviewable patches" if len(patches) > 0 else "No eligible findings for patch proposal",
+                            completed_at=datetime.now(timezone.utc).isoformat(),
                         )
-                    elif len(patches) == attempted_count:
+                    elif new_patches_count == attempted_count:
                         patch_span.set_outcome("completed")
                         run.stages["proposal"] = StageRecord(
                             name="proposal",
                             status="completed",
                             duration_seconds=1.0,
                             details=f"Proposed {len(patches)} reviewable patches (retry)",
+                            completed_at=datetime.now(timezone.utc).isoformat(),
                         )
-                    elif len(patches) > 0:
+                    elif new_patches_count > 0:
                         patch_span.set_outcome(
                             "partial",
-                            details=f"Proposed {len(patches)}/{attempted_count} patches ({failed_count} failed)",
+                            details=f"Proposed {new_patches_count}/{attempted_count} new patches ({failed_count} failed)",
                         )
                         run.stages["proposal"] = StageRecord(
                             name="proposal",
                             status="partial",
                             duration_seconds=1.0,
-                            details=f"Proposed {len(patches)}/{attempted_count} patches ({failed_count} failed) (retry)",
+                            details=f"Proposed {new_patches_count}/{attempted_count} new patches ({failed_count} failed) (retry)",
+                            completed_at=datetime.now(timezone.utc).isoformat(),
                         )
                     else:
                         patch_span.set_outcome(
@@ -585,9 +658,11 @@ class AgentService:
                             status="failed",
                             duration_seconds=1.0,
                             details=f"Patch generation failed for all {attempted_count} eligible findings (retry)",
+                            completed_at=datetime.now(timezone.utc).isoformat(),
                         )
 
             # Stage 7: quietpatch.verification
+            run.status = "verifying"
             with agent_stage_span(
                 "Deterministic Verification",
                 op="quietpatch.verification",
@@ -598,8 +673,16 @@ class AgentService:
                 verified_count = self.run_baseline_verification(run)
                 verif_span.set_tag("verification_count", verified_count)
                 verif_span.set_outcome("completed")
+                run.stages["verification"] = StageRecord(
+                    name="verification",
+                    status="completed",
+                    duration_seconds=0.1,
+                    details=f"Baseline verification evaluated for {len(run.findings)} findings ({verified_count} targets confirmed)",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
 
             # Stage 8: quietpatch.report_generation
+            run.status = "reporting"
             with agent_stage_span(
                 "Report Generation",
                 op="quietpatch.report_generation",
@@ -607,8 +690,18 @@ class AgentService:
                 provider=self.provider_name,
                 model=run.ai_model,
             ) as report_span:
-                ReportService.generate_report(run)
+                time_summary = calculate_time_saved(run.findings, run.patches)
+                run.time_saved_minutes = time_summary.total_minutes
+                report = ReportService.generate_report(run)
+                report_span.set_tag("time_saved_minutes", report.time_saved.total_minutes)
                 report_span.set_outcome("completed")
+                run.stages["report"] = StageRecord(
+                    name="report",
+                    status="completed",
+                    duration_seconds=0.1,
+                    details=f"Report generated: {report.total_findings} findings, {report.fixes_proposed} patches, {report.time_saved.total_minutes}m saved",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
 
             run_tracer.set_tag("findings_count", len(run.findings))
             run_tracer.set_tag("patches_count", len(run.patches))
@@ -616,4 +709,5 @@ class AgentService:
             run_tracer.set_status("ok")
 
         run.status = "completed"
+        run.completed_at = datetime.now(timezone.utc).isoformat()
         return run

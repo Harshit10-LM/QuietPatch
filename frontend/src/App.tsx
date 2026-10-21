@@ -55,6 +55,37 @@ export function App() {
     loadSystemData();
   }, []);
 
+  // Poll active run status until terminal status ('completed' or 'failed')
+  useEffect(() => {
+    if (!currentRun) return;
+    const terminalStatuses = ['completed', 'failed', 'cancelled'];
+    if (terminalStatuses.includes(currentRun.status)) {
+      setIsScanning(false);
+      setIsRetryingAi(false);
+      return;
+    }
+
+    setIsScanning(true);
+
+    const intervalId = setInterval(async () => {
+      try {
+        const refreshed = await api.getScan(currentRun.id);
+        setCurrentRun((prev) => (prev && prev.id === refreshed.id ? refreshed : prev));
+        setRuns((prev) => prev.map((r) => (r.id === refreshed.id ? refreshed : r)));
+
+        if (terminalStatuses.includes(refreshed.status)) {
+          setIsScanning(false);
+          setIsRetryingAi(false);
+          clearInterval(intervalId);
+        }
+      } catch (pollErr) {
+        console.error('Error polling run status:', pollErr);
+      }
+    }, 1500);
+
+    return () => clearInterval(intervalId);
+  }, [currentRun?.id, currentRun?.status]);
+
   // 1-Click Fast Demo Scan
   const handleStartDemoScan = async () => {
     setIsScanning(true);
@@ -84,9 +115,11 @@ export function App() {
       setRuns((prev) => [run, ...prev.filter((r) => r.id !== run.id)]);
       setIsNewScanModalOpen(false);
       setActiveTab('runs');
+      if (['completed', 'failed', 'cancelled'].includes(run.status)) {
+        setIsScanning(false);
+      }
     } catch (e: any) {
       setScanError(e.message);
-    } finally {
       setIsScanning(false);
     }
   };
@@ -122,9 +155,11 @@ export function App() {
       const updated = await api.retryAiAnalysis(currentRun.id);
       setCurrentRun(updated);
       setRuns((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+      if (['completed', 'failed', 'cancelled'].includes(updated.status)) {
+        setIsRetryingAi(false);
+      }
     } catch (e: any) {
       alert(`Failed to retry AI analysis: ${e.message}`);
-    } finally {
       setIsRetryingAi(false);
     }
   };

@@ -121,15 +121,174 @@ def test_retry_ai_endpoint(client):
     run_data = scan_res.get_json()
     run_id = run_data["id"]
 
-    # 2. Call retry-ai
+    # 2. Call retry-ai (returns 202 Accepted background contract)
     retry_res = client.post(f"/api/scans/{run_id}/retry-ai")
-    assert retry_res.status_code == 200
+    assert retry_res.status_code == 202
     updated_run = retry_res.get_json()
     assert updated_run["id"] == run_id
-    assert updated_run["status"] == "completed"
-    assert len(updated_run["findings"]) == len(run_data["findings"])
+    assert updated_run["status"] in {"analyzing", "completed"}
 
-    # 3. Non-existent run returns 404
+    # 3. Poll for completion
+    import time
+    polled_data = updated_run
+    for _ in range(50):
+        if polled_data["status"] == "completed":
+            break
+        time.sleep(0.05)
+        poll_res = client.get(f"/api/scans/{run_id}")
+        assert poll_res.status_code == 200
+        polled_data = poll_res.get_json()
+
+    assert polled_data["status"] == "completed"
+    assert len(polled_data["findings"]) == len(run_data["findings"])
+
+    # 4. Non-existent run returns 404
     missing_res = client.post("/api/scans/non-existent-run-id/retry-ai")
     assert missing_res.status_code == 404
+
+
+def test_create_scan_returns_202_promptly_while_inference_is_blocked(client):
+    """1. Starting a maintenance run returns HTTP 202 promptly (<0.25s) even while AI inference is blocked."""
+    import threading
+    import time
+    from unittest.mock import patch
+    from backend.ai.agent_service import AgentService
+
+    block_event = threading.Event()
+    original_analyze = AgentService._init_provider
+
+    def mock_init_provider(self, name):
+        provider = original_analyze(self, name)
+        original_m = provider.analyze_and_prioritize
+
+        def blocking_analyze(findings, run_id=None):
+            block_event.wait(timeout=5.0)
+            return original_m(findings, run_id=run_id)
+
+        provider.analyze_and_prioritize = blocking_analyze
+        return provider
+
+    t0 = time.time()
+    with patch.object(AgentService, "_init_provider", mock_init_provider):
+        res = client.post("/api/scans", json={"type": "sample", "provider": "demo"})
+        elapsed = time.time() - t0
+
+    # 1. HTTP request returns immediately without waiting for inference
+    assert elapsed < 0.35, f"Expected prompt response, took {elapsed}s"
+    assert res.status_code == 202
+    run_data = res.get_json()
+    run_id = run_data["id"]
+    assert run_data["status"] == "queued"
+    assert "initialization" in run_data["stages"]
+
+    # 2. Polling while blocked reflects in-flight non-terminal status
+    poll_res = client.get(f"/api/scans/{run_id}")
+    assert poll_res.status_code == 200
+    assert poll_res.get_json()["status"] in {
+        "queued", "initializing", "discovering", "scanning", "analyzing"
+    }
+
+    # 3. Unblock provider and poll until completed
+    block_event.set()
+    final_data = None
+    for _ in range(50):
+        time.sleep(0.05)
+        p = client.get(f"/api/scans/{run_id}").get_json()
+        if p["status"] == "completed":
+            final_data = p
+            break
+
+    assert final_data is not None
+    assert final_data["status"] == "completed"
+    assert len(final_data["findings"]) > 0
+
+
+def test_duplicate_scan_submission_prevented(client):
+    """2. Duplicate submission for an already-active repository returns HTTP 409 Conflict."""
+    import threading
+    import time
+    from unittest.mock import patch
+    from backend.ai.agent_service import AgentService
+
+    block_event = threading.Event()
+
+    def mock_init(self, name):
+        provider = AgentService._init_provider(self, name)
+        orig = provider.analyze_and_prioritize
+
+        def slow_analyze(findings, run_id=None):
+            block_event.wait(timeout=5.0)
+            return orig(findings, run_id=run_id)
+
+        provider.analyze_and_prioritize = slow_analyze
+        return provider
+
+    with patch.object(AgentService, "_init_provider", mock_init):
+        res1 = client.post("/api/scans", json={"type": "sample", "provider": "demo"})
+        assert res1.status_code == 202
+        run1_id = res1.get_json()["id"]
+
+        # Duplicate scan while run1 is active
+        res2 = client.post("/api/scans", json={"type": "sample", "provider": "demo"})
+        assert res2.status_code == 409
+        err_data = res2.get_json()
+        assert "already active" in err_data["error"]
+        assert err_data["run"]["id"] == run1_id
+
+        block_event.set()
+
+    # Wait for completion
+    for _ in range(40):
+        time.sleep(0.05)
+        if client.get(f"/api/scans/{run1_id}").get_json()["status"] == "completed":
+            break
+
+
+def test_long_running_inference_does_not_timeout_http(client):
+    """3. A run taking longer than the former 120s worker limit returns HTTP 202 promptly."""
+    import time
+
+    t0 = time.time()
+    res = client.post("/api/scans", json={"type": "sample", "provider": "demo"})
+    elapsed = time.time() - t0
+
+    assert res.status_code == 202
+    assert elapsed < 0.25, f"HTTP request took {elapsed}s, must not block for inference duration"
+    run_id = res.get_json()["id"]
+
+    # Poll status is available immediately
+    status_res = client.get(f"/api/scans/{run_id}")
+    assert status_res.status_code == 200
+
+
+def test_concurrent_web_requests_safe_access(client):
+    """4. Multiple concurrent web requests safely read and poll shared in-memory run state without errors."""
+    import concurrent.futures
+
+    # Start a scan
+    scan_res = client.post("/api/demo/scan")
+    assert scan_res.status_code == 200
+    run_id = scan_res.get_json()["id"]
+
+    app = client.application
+    errors = []
+
+    def make_requests():
+        try:
+            thread_client = app.test_client()
+            for _ in range(5):
+                r1 = thread_client.get("/api/scans")
+                assert r1.status_code == 200
+                r2 = thread_client.get(f"/api/scans/{run_id}")
+                assert r2.status_code == 200
+                r3 = thread_client.get("/api/health")
+                assert r3.status_code == 200
+        except Exception as e:
+            errors.append(e)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(make_requests) for _ in range(8)]
+        concurrent.futures.wait(futures)
+
+    assert len(errors) == 0, f"Concurrent requests encountered errors: {errors}"
 

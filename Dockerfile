@@ -45,5 +45,5 @@ EXPOSE 5001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${PORT:-5001}/api/health || exit 1
 
-# Production WSGI startup
-CMD exec gunicorn --bind 0.0.0.0:${PORT:-5001} --workers 2 --timeout 120 "backend.app:create_app()"
+# Production WSGI startup (1 worker + 8 threads preserves shared in-process state on single-instance Render)
+CMD exec gunicorn --bind 0.0.0.0:${PORT:-5001} --workers 1 --threads 8 --timeout 120 "backend.app:create_app()"

@@ -1,6 +1,10 @@
 """QuietPatch Flask Application and REST API."""
+import concurrent.futures
 import logging
 import os
+import threading
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 from flask import Flask, jsonify, request, send_from_directory
@@ -8,7 +12,7 @@ from flask_cors import CORS
 
 from backend.ai.agent_service import AgentService
 from backend.config import Config
-from backend.models import MaintenanceRun, PatchStatus
+from backend.models import MaintenanceRun, PatchStatus, StageRecord
 from backend.services.patch_service import PatchError, PatchService
 from backend.services.report_service import ReportService
 from backend.services.repository_service import RepositoryService, SecurityError
@@ -22,6 +26,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("quietpatch.api")
 
+ACTIVE_STATUSES = {
+    "queued",
+    "initializing",
+    "discovering",
+    "scanning",
+    "analyzing",
+    "prioritizing",
+    "proposing",
+    "verifying",
+    "reporting",
+}
+
 def create_app() -> Flask:
     app = Flask(__name__, static_folder=str(Config.FRONTEND_DIST))
     CORS(app)
@@ -34,8 +50,12 @@ def create_app() -> Flask:
         traces_sample_rate=Config.SENTRY_TRACES_SAMPLE_RATE,
     )
 
-    # In-memory storage for active sessions/runs (ephemeral & thread-safe for MVP)
+    # In-memory storage for active sessions/runs (thread-safe with RLock)
     runs_store: Dict[str, MaintenanceRun] = {}
+    runs_lock = threading.RLock()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="quietpatch-worker")
+    active_jobs: Dict[str, concurrent.futures.Future] = {}
+
     repo_service = RepositoryService()
     patch_service = PatchService()
     verification_service = VerificationService()
@@ -44,8 +64,6 @@ def create_app() -> Flask:
     # During automated testing (pytest), skip pre-population to keep test execution fast and deterministic
     is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
     if not os.environ.get("PYTEST_CURRENT_TEST") and not app.config.get("TESTING") and (is_reloader_child or not app.debug):
-        import threading
-
         def _init_sample_run():
             try:
                 if Config.SAMPLE_REPO_PATH.exists():
@@ -56,7 +74,8 @@ def create_app() -> Flask:
                         repo_type="sample",
                         run_id="run-sample-01",
                     )
-                    runs_store[initial_run.id] = initial_run
+                    with runs_lock:
+                        runs_store[initial_run.id] = initial_run
                     logger.info(
                         "Initialized default sample run '%s' with %d findings (provider=%s).",
                         initial_run.id,
@@ -154,14 +173,19 @@ def create_app() -> Flask:
     # Maintenance Runs & Scan Endpoints
     # =========================================================================
 
+    # =========================================================================
+    # Maintenance Runs & Scan Endpoints
+    # =========================================================================
+
     @app.route("/api/scans", methods=["POST"])
     def create_scan():
-        """Starts a full caretaker maintenance run on a target repository."""
+        """Starts a full caretaker maintenance run on a target repository asynchronously."""
         data = request.get_json() or {}
         repo_type = data.get("type", "local")
         path_or_url = data.get("path", "").strip()
         provider_name = data.get("provider", Config.AI_PROVIDER)
 
+        # Immediate input validation and security checks
         try:
             if repo_type == "sample":
                 resolved_path = Config.SAMPLE_REPO_PATH
@@ -174,17 +198,73 @@ def create_app() -> Flask:
                 resolved_path = repo_service.validate_local_path(path_or_url)
                 repo_name = resolved_path.name
         except SecurityError as se:
-            return jsonify({"error": str(se)}), 400
+            from backend.ai.gemma_api_provider import sanitize_error_message
+            return jsonify({"error": sanitize_error_message(str(se))}), 400
+        except Exception as err:
+            from backend.ai.gemma_api_provider import sanitize_error_message
+            return jsonify({"error": sanitize_error_message(str(err))}), 400
 
-        agent = AgentService(provider_name=provider_name)
-        run = agent.execute_maintenance_run(
-            repo_path=resolved_path,
-            repo_name=repo_name,
-            repo_type=repo_type,
-        )
+        # Prevent duplicate submissions for the same repository while active
+        resolved_str = str(resolved_path)
+        with runs_lock:
+            for existing in runs_store.values():
+                if existing.status in ACTIVE_STATUSES and existing.repository_path == resolved_str:
+                    return jsonify({
+                        "error": f"A maintenance run ({existing.id}) is already active for repository '{repo_name}'.",
+                        "run": existing.model_dump(),
+                    }), 409
 
-        runs_store[run.id] = run
-        return jsonify(run.model_dump()), 201
+            # Build initial queued run record with all 8 stages initialized
+            run_id = f"run-{uuid.uuid4().hex[:8]}"
+            initial_stages = {
+                "initialization": StageRecord(name="initialization", status="pending"),
+                "discovery": StageRecord(name="discovery", status="pending"),
+                "scan": StageRecord(name="scan", status="pending"),
+                "analysis": StageRecord(name="analysis", status="pending"),
+                "prioritization": StageRecord(name="prioritization", status="pending"),
+                "proposal": StageRecord(name="proposal", status="pending"),
+                "verification": StageRecord(name="verification", status="pending"),
+                "report": StageRecord(name="report", status="pending"),
+            }
+            run = MaintenanceRun(
+                id=run_id,
+                repository_name=repo_name,
+                repository_path=resolved_str,
+                repository_type=repo_type,
+                status="queued",
+                stages=initial_stages,
+                ai_provider=provider_name,
+                ai_model="pending",
+            )
+            runs_store[run.id] = run
+            initial_dump = run.model_dump()
+
+        # Submit background worker execution to ThreadPoolExecutor
+        def _bg_scan_worker(target_run: MaintenanceRun, p_path: Path, p_name: str, p_type: str, p_provider: str):
+            try:
+                agent = AgentService(provider_name=p_provider)
+                agent.execute_maintenance_run(
+                    repo_path=p_path,
+                    repo_name=p_name,
+                    repo_type=p_type,
+                    existing_run=target_run,
+                )
+            except Exception as bg_err:
+                logger.error("Background maintenance run %s failed: %s", target_run.id, bg_err, exc_info=True)
+                with runs_lock:
+                    target_run.status = "failed"
+                    from backend.ai.gemma_api_provider import sanitize_error_message
+                    target_run.error = sanitize_error_message(str(bg_err))
+            finally:
+                with runs_lock:
+                    active_jobs.pop(target_run.id, None)
+
+        future = executor.submit(_bg_scan_worker, run, resolved_path, repo_name, repo_type, provider_name)
+        with runs_lock:
+            active_jobs[run.id] = future
+
+        # Return HTTP 202 Accepted immediately with queued run identifier and initial status
+        return jsonify(initial_dump), 202
 
     @app.route("/api/demo/scan", methods=["POST"])
     def start_demo_scan():
@@ -195,75 +275,111 @@ def create_app() -> Flask:
             repo_name="NovaTask (Sample Project)",
             repo_type="sample",
         )
-        runs_store[run.id] = run
+        with runs_lock:
+            runs_store[run.id] = run
         return jsonify(run.model_dump()), 200
 
     @app.route("/api/scans", methods=["GET"])
     def list_scans():
         """Returns all completed or active maintenance runs."""
-        sorted_runs = sorted(
-            runs_store.values(),
-            key=lambda r: r.created_at,
-            reverse=True,
-        )
-        return jsonify([r.model_dump() for r in sorted_runs]), 200
+        with runs_lock:
+            sorted_runs = sorted(
+                list(runs_store.values()),
+                key=lambda r: r.created_at,
+                reverse=True,
+            )
+            return jsonify([r.model_dump() for r in sorted_runs]), 200
 
     @app.route("/api/scans/<run_id>", methods=["GET"])
     def get_scan(run_id: str):
         """Returns status, findings, and patches for a specific run."""
-        run = runs_store.get(run_id)
-        if not run:
-            return jsonify({"error": f"Scan run '{run_id}' not found."}), 404
-        return jsonify(run.model_dump()), 200
+        with runs_lock:
+            run = runs_store.get(run_id)
+            if not run:
+                return jsonify({"error": f"Scan run '{run_id}' not found."}), 404
+            return jsonify(run.model_dump()), 200
 
     @app.route("/api/scans/<run_id>/findings", methods=["GET"])
     def get_scan_findings(run_id: str):
         """Returns findings for a specific run with optional severity/category filtering."""
-        run = runs_store.get(run_id)
-        if not run:
-            return jsonify({"error": f"Scan run '{run_id}' not found."}), 404
+        with runs_lock:
+            run = runs_store.get(run_id)
+            if not run:
+                return jsonify({"error": f"Scan run '{run_id}' not found."}), 404
 
-        sev = request.args.get("severity")
-        cat = request.args.get("category")
+            sev = request.args.get("severity")
+            cat = request.args.get("category")
 
-        findings = run.findings
-        if sev:
-            findings = [f for f in findings if f.severity.value == sev]
-        if cat:
-            findings = [f for f in findings if f.category.value == cat]
+            findings = list(run.findings)
+            if sev:
+                findings = [f for f in findings if f.severity.value == sev]
+            if cat:
+                findings = [f for f in findings if f.category.value == cat]
 
-        return jsonify([f.model_dump() for f in findings]), 200
+            return jsonify([f.model_dump() for f in findings]), 200
 
     @app.route("/api/scans/<run_id>/report", methods=["GET"])
     def get_scan_report(run_id: str):
         """Generates and returns structured maintenance report."""
-        run = runs_store.get(run_id)
-        if not run:
-            return jsonify({"error": f"Scan run '{run_id}' not found."}), 404
-        report = ReportService.generate_report(run)
-        return jsonify(report.model_dump()), 200
+        with runs_lock:
+            run = runs_store.get(run_id)
+            if not run:
+                return jsonify({"error": f"Scan run '{run_id}' not found."}), 404
+            report = ReportService.generate_report(run)
+            return jsonify(report.model_dump()), 200
 
     @app.route("/api/scans/<run_id>/report/markdown", methods=["GET"])
     def export_scan_report_markdown(run_id: str):
         """Exports the maintenance report as GitHub Flavored Markdown."""
-        run = runs_store.get(run_id)
-        if not run:
-            return jsonify({"error": f"Scan run '{run_id}' not found."}), 404
-        report = ReportService.generate_report(run)
-        md_text = ReportService.export_markdown(report)
-        return md_text, 200, {"Content-Type": "text/markdown; charset=utf-8"}
+        with runs_lock:
+            run = runs_store.get(run_id)
+            if not run:
+                return jsonify({"error": f"Scan run '{run_id}' not found."}), 404
+            report = ReportService.generate_report(run)
+            md_text = ReportService.export_markdown(report)
+            return md_text, 200, {"Content-Type": "text/markdown; charset=utf-8"}
 
     @app.route("/api/scans/<run_id>/retry-ai", methods=["POST"])
     def retry_scan_ai(run_id: str):
-        """Retries AI analysis and patch proposal on an existing maintenance run without re-scanning repository."""
-        run = runs_store.get(run_id)
-        if not run:
-            return jsonify({"error": f"Scan run '{run_id}' not found."}), 404
+        """Retries AI analysis and patch proposal on an existing maintenance run asynchronously."""
+        with runs_lock:
+            run = runs_store.get(run_id)
+            if not run:
+                return jsonify({"error": f"Scan run '{run_id}' not found."}), 404
+            if run.status in ACTIVE_STATUSES or run_id in active_jobs:
+                return jsonify({
+                    "error": f"Scan run '{run_id}' is currently active ({run.status}) and cannot be retried concurrently.",
+                    "run": run.model_dump(),
+                }), 409
 
-        agent = AgentService(provider_name=run.ai_provider)
-        updated_run = agent.retry_ai_analysis(run)
-        runs_store[run_id] = updated_run
-        return jsonify(updated_run.model_dump()), 200
+            run.status = "analyzing"
+            run.stages["analysis"] = StageRecord(
+                name="analysis",
+                status="running",
+                details="Retrying AI analysis in background",
+                started_at=datetime.now(timezone.utc).isoformat(),
+            )
+            initial_dump = run.model_dump()
+
+        def _bg_retry_worker(target_run: MaintenanceRun):
+            try:
+                agent = AgentService(provider_name=target_run.ai_provider)
+                agent.retry_ai_analysis(target_run)
+            except Exception as bg_err:
+                logger.error("Background retry AI for %s failed: %s", target_run.id, bg_err, exc_info=True)
+                with runs_lock:
+                    target_run.status = "failed"
+                    from backend.ai.gemma_api_provider import sanitize_error_message
+                    target_run.error = sanitize_error_message(str(bg_err))
+            finally:
+                with runs_lock:
+                    active_jobs.pop(target_run.id, None)
+
+        future = executor.submit(_bg_retry_worker, run)
+        with runs_lock:
+            active_jobs[run.id] = future
+
+        return jsonify(initial_dump), 202
 
     # =========================================================================
     # Fix Queue & Patch Management Endpoints
@@ -275,14 +391,15 @@ def create_app() -> Flask:
         target_run: Optional[MaintenanceRun] = None
         target_finding = None
 
-        for r in runs_store.values():
-            for f in r.findings:
-                if f.id == finding_id:
-                    target_run = r
-                    target_finding = f
+        with runs_lock:
+            for r in runs_store.values():
+                for f in r.findings:
+                    if f.id == finding_id:
+                        target_run = r
+                        target_finding = f
+                        break
+                if target_finding:
                     break
-            if target_finding:
-                break
 
         if not target_finding or not target_run:
             return jsonify({"error": f"Finding '{finding_id}' not found in any active run."}), 404
@@ -334,90 +451,95 @@ def create_app() -> Flask:
         if not patch:
             return jsonify({"error": "AI provider was unable to generate a valid patch diff for this finding."}), 422
 
-        # Add or update patch in run
-        existing_idx = next((i for i, p in enumerate(target_run.patches) if p.id == patch.id), -1)
-        if existing_idx >= 0:
-            target_run.patches[existing_idx] = patch
-        else:
-            target_run.patches.append(patch)
+        # Add or update patch in run with thread-safe lock
+        with runs_lock:
+            existing_idx = next((i for i, p in enumerate(target_run.patches) if p.id == patch.id), -1)
+            if existing_idx >= 0:
+                target_run.patches[existing_idx] = patch
+            else:
+                target_run.patches.append(patch)
 
         return jsonify(patch.model_dump()), 200
 
     @app.route("/api/patches/<patch_id>/approve", methods=["POST"])
     def approve_patch(patch_id: str):
-        for run in runs_store.values():
-            for patch in run.patches:
-                if patch.id == patch_id:
-                    patch.status = PatchStatus.APPROVED
-                    return jsonify(patch.model_dump()), 200
+        with runs_lock:
+            for run in runs_store.values():
+                for patch in run.patches:
+                    if patch.id == patch_id:
+                        patch.status = PatchStatus.APPROVED
+                        return jsonify(patch.model_dump()), 200
         return jsonify({"error": f"Patch '{patch_id}' not found."}), 404
 
     @app.route("/api/patches/<patch_id>/reject", methods=["POST"])
     def reject_patch(patch_id: str):
-        for run in runs_store.values():
-            for patch in run.patches:
-                if patch.id == patch_id:
-                    patch.status = PatchStatus.REJECTED
-                    return jsonify(patch.model_dump()), 200
+        with runs_lock:
+            for run in runs_store.values():
+                for patch in run.patches:
+                    if patch.id == patch_id:
+                        patch.status = PatchStatus.REJECTED
+                        return jsonify(patch.model_dump()), 200
         return jsonify({"error": f"Patch '{patch_id}' not found."}), 404
 
     @app.route("/api/patches/<patch_id>/apply", methods=["POST"])
     def apply_patch_endpoint(patch_id: str):
         """Applies an approved patch locally."""
-        for run in runs_store.values():
-            for patch in run.patches:
-                if patch.id == patch_id:
-                    repo_path = Path(run.repository_path)
-                    try:
-                        updated_patch = patch_service.apply_patch(
-                            repo_path=repo_path,
-                            patch=patch,
-                            run_id=run.id,
-                        )
-                        return jsonify(updated_patch.model_dump()), 200
-                    except PatchError as pe:
-                        return jsonify({"error": str(pe)}), 400
+        with runs_lock:
+            for run in runs_store.values():
+                for patch in run.patches:
+                    if patch.id == patch_id:
+                        repo_path = Path(run.repository_path)
+                        try:
+                            updated_patch = patch_service.apply_patch(
+                                repo_path=repo_path,
+                                patch=patch,
+                                run_id=run.id,
+                            )
+                            return jsonify(updated_patch.model_dump()), 200
+                        except PatchError as pe:
+                            return jsonify({"error": str(pe)}), 400
 
         return jsonify({"error": f"Patch '{patch_id}' not found."}), 404
 
     @app.route("/api/patches/<patch_id>/undo", methods=["POST"])
     def undo_patch_endpoint(patch_id: str):
         """Reverts an applied patch."""
-        for run in runs_store.values():
-            for patch in run.patches:
-                if patch.id == patch_id:
-                    repo_path = Path(run.repository_path)
-                    try:
-                        undone_patch = patch_service.undo_patch(
-                            repo_path=repo_path,
-                            patch=patch,
-                            run_id=run.id,
-                        )
-                        return jsonify(undone_patch.model_dump()), 200
-                    except PatchError as pe:
-                        return jsonify({"error": str(pe)}), 400
+        with runs_lock:
+            for run in runs_store.values():
+                for patch in run.patches:
+                    if patch.id == patch_id:
+                        repo_path = Path(run.repository_path)
+                        try:
+                            undone_patch = patch_service.undo_patch(
+                                repo_path=repo_path,
+                                patch=patch,
+                                run_id=run.id,
+                            )
+                            return jsonify(undone_patch.model_dump()), 200
+                        except PatchError as pe:
+                            return jsonify({"error": str(pe)}), 400
 
         return jsonify({"error": f"Patch '{patch_id}' not found."}), 404
 
     @app.route("/api/patches/<patch_id>/verify", methods=["POST"])
     def verify_patch_endpoint(patch_id: str):
         """Runs deterministic verification for an applied patch."""
-        for run in runs_store.values():
-            for patch in run.patches:
-                if patch.id == patch_id:
-                    repo_path = Path(run.repository_path)
-                    # Find associated finding
-                    finding = next((f for f in run.findings if f.id == patch.finding_id), None)
-                    if not finding:
-                        return jsonify({"error": "Associated finding not found for verification."}), 404
+        with runs_lock:
+            for run in runs_store.values():
+                for patch in run.patches:
+                    if patch.id == patch_id:
+                        repo_path = Path(run.repository_path)
+                        finding = next((f for f in run.findings if f.id == patch.finding_id), None)
+                        if not finding:
+                            return jsonify({"error": "Associated finding not found for verification."}), 404
 
-                    result = verification_service.verify_finding_resolution(
-                        repo_path=repo_path,
-                        finding=finding,
-                        patch=patch,
-                        run_id=run.id,
-                    )
-                    return jsonify(result), 200
+                        result = verification_service.verify_finding_resolution(
+                            repo_path=repo_path,
+                            finding=finding,
+                            patch=patch,
+                            run_id=run.id,
+                        )
+                        return jsonify(result), 200
 
         return jsonify({"error": f"Patch '{patch_id}' not found."}), 404
 
@@ -428,17 +550,18 @@ def create_app() -> Flask:
         run_id = data.get("run_id")
         command_key = data.get("command", "pytest")
 
-        run = runs_store.get(run_id)
-        if not run:
-            return jsonify({"error": "Run not found."}), 404
+        with runs_lock:
+            run = runs_store.get(run_id)
+            if not run:
+                return jsonify({"error": "Run not found."}), 404
 
-        repo_path = Path(run.repository_path)
-        result = verification_service.execute_approved_test_command(
-            repo_path=repo_path,
-            command_key=command_key,
-            run_id=run.id,
-        )
-        return jsonify(result), 200
+            repo_path = Path(run.repository_path)
+            result = verification_service.execute_approved_test_command(
+                repo_path=repo_path,
+                command_key=command_key,
+                run_id=run.id,
+            )
+            return jsonify(result), 200
 
     # =========================================================================
     # Production Frontend Static Asset Serving

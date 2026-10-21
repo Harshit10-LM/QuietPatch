@@ -54,6 +54,7 @@ export const MaintenanceRunPage: React.FC<MaintenanceRunPageProps> = ({
       if (stage.status === 'failed') return 'failed';
       if (stage.status === 'skipped') return 'skipped';
       if (stage.status === 'running') return 'running';
+      if (stage.status === 'pending') return 'pending';
     }
     // In our sequential run: if run completed, earlier stages are completed
     if (currentRun.status === 'completed') {

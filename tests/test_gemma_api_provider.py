@@ -1036,3 +1036,175 @@ def test_regression_10_no_silent_demo_fallback_or_fabricated_explanations(tmp_pa
     assert run.findings[0].ai_assisted is False
     # No fake patches
     assert len(run.patches) == 0
+
+
+def test_max_tokens_truncation_triggers_reduced_scope_recovery(tmp_path):
+    """5. MAX_TOKENS is classified as output_token_truncated and triggers reduced-scope bounded recovery."""
+    provider = GemmaApiProvider()
+    provider.api_key = "test-key-mock"
+
+    finding = Finding(
+        id="f-trunc-1",
+        category=FindingCategory.CONFIGURATION,
+        title="Unpinned package",
+        file_path="config.py",
+        evidence="PORT = 5000",
+        explanation="Default port",
+        suggested_action="Use env port",
+    )
+    file_content = "PORT = 5000\nDEBUG = True\n"
+
+    # Call 1: MAX_TOKENS truncation
+    cand1 = MagicMock()
+    cand1.finish_reason = "MAX_TOKENS"
+    cand1.content = None
+    res1 = MagicMock()
+    res1.candidates = [cand1]
+    res1.text = '{"change_summary": "Incomplete json...'
+
+    # Call 2: Recovery response succeeds with valid patch
+    res2 = MagicMock()
+    res2.candidates = [MagicMock(finish_reason="STOP")]
+    res2.text = json.dumps({
+        "change_summary": "Update port",
+        "proposed_content": "import os\nPORT = int(os.getenv('PORT', 5000))\nDEBUG = True\n",
+        "explanation": "Reads from env",
+        "risks_assumptions": "None",
+        "suggested_verification": "pytest",
+    })
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = [res1, res2]
+
+    with patch.object(provider, "_get_client", return_value=mock_client):
+        patch_result = provider.propose_patch(finding, file_content, tmp_path, run_id="run-trunc-test")
+
+    # Assert recovery was attempted and succeeded
+    assert patch_result is not None
+    assert patch_result.finding_id == "f-trunc-1"
+    assert "PORT = int(os.getenv" in patch_result.proposed_content
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_patch_proposal_failure_preserves_earlier_valid_patches(tmp_path):
+    """6. Failed patch proposals do not erase earlier valid proposals or create false AI-success badges."""
+    f1 = tmp_path / "a.py"
+    f1.write_text("x = 1\n", encoding="utf-8")
+    f2 = tmp_path / "b.py"
+    f2.write_text("y = 2\n", encoding="utf-8")
+
+    finding1 = Finding(
+        id="f1",
+        category=FindingCategory.CONFIGURATION,
+        title="Config 1",
+        file_path="a.py",
+        evidence="x = 1",
+        explanation="exp 1",
+        suggested_action="act 1",
+    )
+    finding2 = Finding(
+        id="f2",
+        category=FindingCategory.CONFIGURATION,
+        title="Config 2",
+        file_path="b.py",
+        evidence="y = 2",
+        explanation="exp 2",
+        suggested_action="act 2",
+    )
+
+    mock_provider = MagicMock()
+    mock_provider.name = "gemma_api"
+    mock_provider.model = "gemma-4-26b-a4b-it"
+
+    def mock_analyze(findings, run_id=None):
+        for f in findings:
+            f.ai_assisted = True
+        return findings
+
+    mock_provider.analyze_and_prioritize.side_effect = mock_analyze
+
+    patch1 = ProposedPatch(
+        id="patch-f1",
+        finding_id="f1",
+        file_path="a.py",
+        change_summary="Update a",
+        original_content="x = 1\n",
+        proposed_content="x = 10\n",
+        diff="--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x = 1\n+x = 10\n",
+        explanation="fix",
+        risks_assumptions="none",
+        suggested_verification="pytest",
+        status=PatchStatus.PENDING,
+    )
+
+    def mock_propose(finding, file_content, repo_path, run_id=None):
+        if finding.id == "f1":
+            return patch1
+        # finding 2 fails
+        raise genai_errors.APIError(500, "Google internal error")
+
+    mock_provider.propose_patch.side_effect = mock_propose
+
+    agent = AgentService(provider_name="gemma_api")
+    agent.provider = mock_provider
+
+    with patch.object(agent.scan_engine, "discover_files", return_value=([f1, f2], 10)), \
+         patch.object(agent.scan_engine, "run_scanners", return_value=([finding1, finding2], {})):
+
+        run = agent.execute_maintenance_run(
+            repo_path=tmp_path,
+            repo_name="PreserveTestRepo",
+            repo_type="local",
+            run_id="run-preserve-test",
+        )
+
+    # Patch 1 must be preserved even though finding 2 proposal failed
+    assert len(run.patches) == 1
+    assert run.patches[0].id == "patch-f1"
+    assert run.stages["proposal"].status == "partial"
+
+
+def test_sentry_spans_report_failures_without_secrets(tmp_path):
+    """8. Sentry spans report failures with sanitized details without leaking API keys or local paths."""
+    prefix = "".join(["AI", "za"])
+    fake_token = prefix + "Sy" + ("Z" * 33)
+
+    mock_provider = MagicMock()
+    mock_provider.name = "gemma_api"
+    mock_provider.model = "gemma-4-26b-a4b-it"
+
+    # Simulate analysis raising an exception with credentials and local path
+    sensitive_msg = f"Failed with key={fake_token} at /Users/harshu/secret/repo.py: Service down"
+    mock_provider.analyze_and_prioritize.side_effect = RuntimeError(sensitive_msg)
+
+    agent = AgentService(provider_name="gemma_api")
+    agent.provider = mock_provider
+
+    f1 = tmp_path / "app.py"
+    f1.write_text("x = 1\n", encoding="utf-8")
+    finding = Finding(
+        id="f1",
+        category=FindingCategory.CONFIGURATION,
+        title="Title",
+        file_path="app.py",
+        evidence="x = 1",
+        explanation="exp",
+        suggested_action="act",
+    )
+
+    with patch.object(agent.scan_engine, "discover_files", return_value=([f1], 10)), \
+         patch.object(agent.scan_engine, "run_scanners", return_value=([finding], {})):
+
+        run = agent.execute_maintenance_run(
+            repo_path=tmp_path,
+            repo_name="SanitizeTestRepo",
+            repo_type="local",
+            run_id="run-sanitize-test",
+        )
+
+    # Analysis failed, details sanitized
+    analysis_stage = run.stages["analysis"]
+    assert analysis_stage.status == "failed"
+    assert fake_token not in analysis_stage.details
+    assert "/Users/harshu" not in analysis_stage.details
+    assert "[REDACTED" in analysis_stage.details
