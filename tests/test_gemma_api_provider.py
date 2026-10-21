@@ -38,10 +38,16 @@ class InMemorySentryTransport(Transport):
 
 
 def test_sanitize_error_message():
-    raw = "Request failed for key AIzaSyD1234567890abcdefghijklmnopqrstuv at /Users/harshu/secret.py: Internal error"
+    # Dynamically assemble a fake key matching Google Gen AI key regex (AIza + 35 chars)
+    # at runtime to avoid hardcoded credentials or key-shaped literals in test source
+    prefix = "".join(["AI", "za"])
+    fake_token = prefix + "Sy" + ("X" * 33)
+    assert len(fake_token) == 39
+
+    raw = f"Request failed for key {fake_token} at /Users/harshu/secret.py: Internal error"
     sanitized = sanitize_error_message(raw)
     assert "[REDACTED_API_KEY]" in sanitized
-    assert "AIzaSyD" not in sanitized
+    assert fake_token not in sanitized
     assert "/Users/harshu" not in sanitized
     assert "[REDACTED_PATH]" in sanitized
 

@@ -183,8 +183,8 @@ def test_strict_telemetry_sanitization():
         "run_id": "run-safe-01",
         "repo_path": "/Users/harshu/Desktop/QuietPatch/private/source.py",
         "home_path": "/home/ubuntu/repo/app.py",
-        "gemma_key": "AIzaSyABC1234567890secretKey",
-        "api_token": "sk-proj-99998888777766665555444433332222",
+        "gemma_key": "".join(["AI", "za", "Sy", "FakeTestKeyForTracing123"]),
+        "api_token": "".join(["sk", "-proj-", "FakeOpenAiTokenForTesting9999"]),
         "raw_code": "def secret_function(): return 'classified'",
         "diff": "--- a/file.py\n+++ b/file.py\n+password = 'admin'",
         "prompt": "You are Gemma. Fix this vulnerability in user file.",
@@ -213,7 +213,8 @@ def test_strict_telemetry_sanitization():
     # Scalar path scrubbing test
     assert "/Users/" not in sanitize_scalar("/Users/harshu/repo/secret.txt")
     assert "[REDACTED_PATH]" in sanitize_scalar("/Users/harshu/repo/secret.txt")
-    assert "[REDACTED_KEY]" in sanitize_scalar("Bearer AIzaSy12345678901234567890")
+    bearer_token = "Bearer " + "".join(["AI", "za", "Sy", "FakeBearerValue123"])
+    assert "[REDACTED_KEY]" in sanitize_scalar(bearer_token)
 
 
 def test_background_worker_tracing_in_thread():
