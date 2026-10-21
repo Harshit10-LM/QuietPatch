@@ -31,6 +31,14 @@ class Config:
     # Hosted Gemma Settings (Google Gen AI)
     GEMMA_API_KEY = os.getenv("GEMMA_API_KEY", "").strip()
     GEMMA_API_MODEL = os.getenv("GEMMA_API_MODEL", "gemma-4-26b-a4b-it")
+    try:
+        GEMMA_API_MAX_RETRIES = int(os.getenv("GEMMA_API_MAX_RETRIES", "2"))
+    except ValueError:
+        GEMMA_API_MAX_RETRIES = 2
+    try:
+        GEMMA_API_BACKOFF_FACTOR = float(os.getenv("GEMMA_API_BACKOFF_FACTOR", "0.5"))
+    except ValueError:
+        GEMMA_API_BACKOFF_FACTOR = 0.5
 
     # Security Boundaries
     default_allowed_root = str(BASE_DIR.resolve())
@@ -68,6 +76,8 @@ class Config:
             "ollama_batch_size": cls.OLLAMA_BATCH_SIZE,
             "gemma_api_model": cls.GEMMA_API_MODEL,
             "has_gemma_api_key": bool(cls.GEMMA_API_KEY),
+            "gemma_api_max_retries": cls.GEMMA_API_MAX_RETRIES,
+            "gemma_api_backoff_factor": cls.GEMMA_API_BACKOFF_FACTOR,
             "allowed_root": str(cls.QUIETPATCH_ALLOWED_ROOT),
             "sentry_configured": bool(cls.SENTRY_DSN),
             "sentry_environment": cls.SENTRY_ENVIRONMENT,

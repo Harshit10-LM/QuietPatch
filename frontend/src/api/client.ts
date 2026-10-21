@@ -21,9 +21,20 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
     let errorMsg = `Request failed with status ${res.status}`;
     try {
       const errData = await res.json();
-      if (errData.error) errorMsg = errData.error;
+      if (errData.error) {
+        errorMsg = errData.error;
+      } else if (errData.message) {
+        errorMsg = errData.message;
+      }
     } catch {
-      // ignore json parse error
+      try {
+        const rawText = await res.text();
+        if (rawText && rawText.length < 300 && !rawText.includes('<!DOCTYPE') && !rawText.includes('<html')) {
+          errorMsg = rawText.trim();
+        }
+      } catch {
+        // ignore text read error
+      }
     }
     throw new Error(errorMsg);
   }

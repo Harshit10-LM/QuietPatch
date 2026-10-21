@@ -271,15 +271,15 @@ class AgentService:
                     model=run.ai_model,
                     extra_tags={"findings_count": len(run.findings)},
                 ) as patch_span:
-                    if not analysis_succeeded and self.provider_name == "ollama":
-                        # Do NOT synthesize fake patches when local Ollama analysis failed
+                    if not analysis_succeeded and self.provider_name in {"ollama", "gemma_api"}:
+                        # Do NOT synthesize fake patches when AI model analysis failed
                         prop_duration = round(time.time() - t_prop, 3)
-                        patch_span.set_outcome("skipped", details="Ollama model analysis was unavailable")
+                        patch_span.set_outcome("skipped", details=f"{self.provider_name} model analysis was unavailable")
                         record_stage(
                             "proposal",
                             "skipped",
                             prop_duration,
-                            "Skipped patch synthesis because local Ollama model analysis was unavailable",
+                            f"Skipped patch synthesis because {self.provider_name} model analysis was unavailable",
                         )
                     else:
                         eligible_findings = [
@@ -287,33 +287,74 @@ class AgentService:
                             if f.category.value in {"configuration", "documentation", "general", "javascript"}
                         ][:3]
 
-                        for finding in eligible_findings:
-                            target_file = repo_path / finding.file_path
-                            file_content = ""
-                            if target_file.is_file():
+                        if not eligible_findings:
+                            prop_duration = round(time.time() - t_prop, 3)
+                            patch_span.set_outcome("skipped", details="No eligible findings for patch proposal")
+                            record_stage(
+                                "proposal",
+                                "skipped",
+                                prop_duration,
+                                "No eligible findings for automated patch proposal",
+                            )
+                        else:
+                            attempted_count = len(eligible_findings)
+                            failed_count = 0
+                            for finding in eligible_findings:
+                                target_file = repo_path / finding.file_path
+                                file_content = ""
+                                if target_file.is_file():
+                                    try:
+                                        with open(target_file, "r", encoding="utf-8", errors="replace") as f:
+                                            file_content = f.read()
+                                    except Exception:
+                                        pass
+
                                 try:
-                                    with open(target_file, "r", encoding="utf-8", errors="replace") as f:
-                                        file_content = f.read()
-                                except Exception:
-                                    pass
+                                    patch = self.provider.propose_patch(finding, file_content, repo_path, run_id=run_id)
+                                    if patch and patch.diff:
+                                        patches.append(patch)
+                                    else:
+                                        failed_count += 1
+                                except Exception as patch_err:
+                                    failed_count += 1
+                                    logger.warning("Patch proposal failed for %s: %s", finding.id, patch_err)
 
-                            try:
-                                patch = self.provider.propose_patch(finding, file_content, repo_path, run_id=run_id)
-                                if patch and patch.diff:
-                                    patches.append(patch)
-                            except Exception as patch_err:
-                                logger.warning("Patch proposal failed for %s: %s", finding.id, patch_err)
+                            run.patches = patches
+                            prop_duration = round(time.time() - t_prop, 3)
+                            patch_span.set_tag("patches_count", len(patches))
+                            patch_span.set_tag("attempted_count", attempted_count)
+                            patch_span.set_tag("failed_count", failed_count)
 
-                        run.patches = patches
-                        prop_duration = round(time.time() - t_prop, 3)
-                        patch_span.set_tag("patches_count", len(patches))
-                        patch_span.set_outcome("completed" if patches else "skipped")
-                        record_stage(
-                            "proposal",
-                            "completed" if patches else "skipped",
-                            prop_duration,
-                            f"Proposed {len(patches)} reviewable patches",
-                        )
+                            if len(patches) == attempted_count:
+                                patch_span.set_outcome("completed")
+                                record_stage(
+                                    "proposal",
+                                    "completed",
+                                    prop_duration,
+                                    f"Proposed {len(patches)} reviewable patches",
+                                )
+                            elif len(patches) > 0:
+                                patch_span.set_outcome(
+                                    "partial",
+                                    details=f"Proposed {len(patches)}/{attempted_count} patches ({failed_count} failed)",
+                                )
+                                record_stage(
+                                    "proposal",
+                                    "partial",
+                                    prop_duration,
+                                    f"Proposed {len(patches)}/{attempted_count} patches ({failed_count} patch generation attempts failed)",
+                                )
+                            else:
+                                patch_span.set_outcome(
+                                    "failed",
+                                    details=f"All {attempted_count} patch generation attempts failed",
+                                )
+                                record_stage(
+                                    "proposal",
+                                    "failed",
+                                    prop_duration,
+                                    f"Patch generation failed for all {attempted_count} eligible findings",
+                                )
 
                 # Stage 7: quietpatch.verification
                 with agent_stage_span(
@@ -480,6 +521,9 @@ class AgentService:
                         if f.category.value in {"configuration", "documentation", "general", "javascript"}
                     ][:3]
                     patches: List[ProposedPatch] = []
+                    failed_count = 0
+                    attempted_count = len(eligible_findings)
+
                     for finding in eligible_findings:
                         target_file = repo_path / finding.file_path
                         file_content = ""
@@ -493,17 +537,55 @@ class AgentService:
                             patch = self.provider.propose_patch(finding, file_content, repo_path, run_id=run.id)
                             if patch and patch.diff:
                                 patches.append(patch)
+                            else:
+                                failed_count += 1
                         except Exception as patch_err:
+                            failed_count += 1
                             logger.warning("Patch proposal failed for %s during retry: %s", finding.id, patch_err)
+
                     run.patches = patches
                     patch_span.set_tag("patches_count", len(patches))
-                    patch_span.set_outcome("completed" if patches else "skipped")
-                    run.stages["proposal"] = StageRecord(
-                        name="proposal",
-                        status="completed" if patches else "skipped",
-                        duration_seconds=1.0,
-                        details=f"Proposed {len(patches)} reviewable patches (retry)",
-                    )
+                    patch_span.set_tag("attempted_count", attempted_count)
+                    patch_span.set_tag("failed_count", failed_count)
+
+                    if attempted_count == 0:
+                        patch_span.set_outcome("skipped", details="No eligible findings")
+                        run.stages["proposal"] = StageRecord(
+                            name="proposal",
+                            status="skipped",
+                            duration_seconds=0.1,
+                            details="No eligible findings for patch proposal",
+                        )
+                    elif len(patches) == attempted_count:
+                        patch_span.set_outcome("completed")
+                        run.stages["proposal"] = StageRecord(
+                            name="proposal",
+                            status="completed",
+                            duration_seconds=1.0,
+                            details=f"Proposed {len(patches)} reviewable patches (retry)",
+                        )
+                    elif len(patches) > 0:
+                        patch_span.set_outcome(
+                            "partial",
+                            details=f"Proposed {len(patches)}/{attempted_count} patches ({failed_count} failed)",
+                        )
+                        run.stages["proposal"] = StageRecord(
+                            name="proposal",
+                            status="partial",
+                            duration_seconds=1.0,
+                            details=f"Proposed {len(patches)}/{attempted_count} patches ({failed_count} failed) (retry)",
+                        )
+                    else:
+                        patch_span.set_outcome(
+                            "failed",
+                            details=f"All {attempted_count} patch generation attempts failed",
+                        )
+                        run.stages["proposal"] = StageRecord(
+                            name="proposal",
+                            status="failed",
+                            duration_seconds=1.0,
+                            details=f"Patch generation failed for all {attempted_count} eligible findings (retry)",
+                        )
 
             # Stage 7: quietpatch.verification
             with agent_stage_span(

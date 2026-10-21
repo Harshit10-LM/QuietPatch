@@ -2,6 +2,9 @@
 import difflib
 import json
 import logging
+import random
+import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -21,12 +24,100 @@ SYSTEM_INSTRUCTION = (
     "4. Return strictly valid JSON adhering to the requested schema.\n"
 )
 
+
+class GemmaApiError(Exception):
+    """Base exception for Hosted Gemma API failures."""
+
+    def __init__(self, message: str, code: Optional[int] = None):
+        super().__init__(message)
+        self.sanitized_message = sanitize_error_message(message)
+        self.code = code
+
+
+class GemmaApiTransientError(GemmaApiError):
+    """Transient upstream Google Gen AI error (e.g. 500, 503, 429, timeouts)."""
+    pass
+
+
+def sanitize_error_message(msg: str) -> str:
+    """Sanitizes raw error message by scrubbing API keys, local paths, and private details."""
+    if not msg:
+        return "Unknown error"
+    # Scrub API keys
+    cleaned = re.sub(r"AIza[0-9A-Za-z_-]{35}", "[REDACTED_API_KEY]", str(msg))
+    cleaned = re.sub(
+        r"(key|token|secret|password)=['\"]?[^\s'\"]+['\"]?",
+        r"\1=[REDACTED]",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    # Scrub filesystem paths
+    cleaned = re.sub(r"/(?:Users|home|root|var|etc)/[^\s:\"']+", "[REDACTED_PATH]", cleaned)
+    if len(cleaned) > 200:
+        cleaned = cleaned[:200] + "..."
+    return cleaned.strip()
+
+
+def is_transient_error(exc: Exception) -> bool:
+    """Identifies transient upstream errors eligible for bounded retry."""
+    # Check for google.genai errors
+    try:
+        from google.genai import errors as genai_errors
+        if isinstance(exc, genai_errors.ServerError):
+            return True
+        if isinstance(exc, genai_errors.APIError):
+            code = getattr(exc, "code", None)
+            if code in {429, 500, 502, 503, 504}:
+                return True
+            if code is not None and 400 <= code < 500:
+                return False
+    except ImportError:
+        pass
+
+    # Check for HTTP / network client errors
+    try:
+        import httpx
+        if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError)):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code in {429, 500, 502, 503, 504}
+    except ImportError:
+        pass
+
+    if isinstance(exc, (TimeoutError, ConnectionResetError, ConnectionRefusedError)):
+        return True
+
+    msg = str(exc).lower()
+    if any(k in msg for k in ["500", "502", "503", "504", "429", "timeout", "overloaded", "temporarily unavailable"]):
+        if not any(k in msg for k in ["401", "403", "unauthorized", "permission denied", "not found"]):
+            return True
+
+    return False
+
+
+def extract_error_code(exc: Exception) -> Optional[int]:
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    if hasattr(exc, "response") and hasattr(exc.response, "status_code"):
+        return exc.response.status_code
+    return None
+
+
 class GemmaApiProvider(BaseAIProvider):
     name = "gemma_api"
 
-    def __init__(self, api_key: str = Config.GEMMA_API_KEY, model: str = Config.GEMMA_API_MODEL):
+    def __init__(
+        self,
+        api_key: str = Config.GEMMA_API_KEY,
+        model: str = Config.GEMMA_API_MODEL,
+        max_retries: int = Config.GEMMA_API_MAX_RETRIES,
+        backoff_factor: float = Config.GEMMA_API_BACKOFF_FACTOR,
+    ):
         self.api_key = api_key
         self.model = model
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
         self._client = None
 
     def _get_client(self):
@@ -35,7 +126,7 @@ class GemmaApiProvider(BaseAIProvider):
                 from google import genai
                 self._client = genai.Client(api_key=self.api_key)
             except Exception as e:
-                logger.warning("Failed to initialize Google Gen AI Client: %s", e)
+                logger.warning("Failed to initialize Google Gen AI Client: %s", sanitize_error_message(str(e)))
                 self._client = None
         return self._client
 
@@ -74,12 +165,104 @@ class GemmaApiProvider(BaseAIProvider):
             "privacy_notice": "Privacy Notice: Hosted inference sends selected repository snippets to Google Gen AI APIs.",
         }
 
+    def _generate_with_retry(
+        self,
+        prompt: str,
+        client: Any,
+        span: Optional[Any] = None,
+        max_output_tokens: int = 2048,
+    ) -> Any:
+        """Executes generate_content with bounded retries and exponential backoff for transient errors."""
+        config = None
+        try:
+            from google import genai
+            config = genai.types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=max_output_tokens,
+            )
+        except Exception:
+            pass
+
+        last_error = None
+        total_attempts = self.max_retries + 1
+
+        for attempt in range(1, total_attempts + 1):
+            try:
+                kwargs = {"model": self.model, "contents": prompt}
+                if config is not None:
+                    kwargs["config"] = config
+                return client.models.generate_content(**kwargs)
+            except Exception as exc:
+                last_error = exc
+                transient = is_transient_error(exc)
+                code = extract_error_code(exc)
+                sanitized_msg = sanitize_error_message(str(exc))
+
+                if not transient:
+                    logger.error(
+                        "Hosted Gemma permanent error (non-retryable, code=%s): %s",
+                        code, sanitized_msg
+                    )
+                    if span:
+                        span.set_data("error_code", code or "client_error")
+                        span.set_data("is_transient", False)
+                    raise GemmaApiError(f"Gemma API permanent client error: {sanitized_msg}", code=code) from exc
+
+                if attempt >= total_attempts:
+                    logger.error(
+                        "Hosted Gemma transient error exhausted after %d attempts (code=%s): %s",
+                        attempt, code, sanitized_msg
+                    )
+                    if span:
+                        span.set_data("exhausted_attempts", attempt)
+                        span.set_data("error_code", code or 500)
+                    raise GemmaApiTransientError(
+                        f"Gemma API request failed after {attempt} attempts: {sanitized_msg}",
+                        code=code
+                    ) from exc
+
+                delay = (self.backoff_factor * (2 ** (attempt - 1))) + random.uniform(0.1, 0.4)
+                logger.warning(
+                    "Hosted Gemma transient error on attempt %d/%d (code=%s): %s. Retrying in %.2fs...",
+                    attempt, total_attempts, code, sanitized_msg, delay
+                )
+                if span:
+                    span.set_data(f"retry_{attempt}_code", code or "unknown")
+                time.sleep(delay)
+
+        raise GemmaApiTransientError(f"Gemma API failed: {sanitize_error_message(str(last_error))}")
+
+    @staticmethod
+    def _bound_file_content(file_content: str, finding: Finding, max_chars: int = 2000) -> str:
+        """Keeps request payload bounded without losing evidence required to propose a safe patch."""
+        if not file_content or len(file_content) <= max_chars:
+            return file_content
+
+        lines = file_content.splitlines(keepends=True)
+        target_idx = -1
+        evidence_snippet = (finding.evidence or "").strip()
+        if evidence_snippet:
+            for idx, line in enumerate(lines):
+                if evidence_snippet[:40] in line:
+                    target_idx = idx
+                    break
+
+        if target_idx >= 0:
+            start_line = max(0, target_idx - 25)
+            end_line = min(len(lines), target_idx + 26)
+            window = "".join(lines[start_line:end_line])
+            if len(window) <= max_chars:
+                return window
+            return window[:max_chars]
+
+        return file_content[:max_chars]
+
     def analyze_and_prioritize(
         self,
         findings: List[Finding],
         run_id: Optional[str] = None
     ) -> List[Finding]:
-        """Analyzes findings using hosted Gemma API."""
+        """Analyzes findings using hosted Gemma API with bounded payload and retry."""
         if not findings or not self.api_key:
             return findings
 
@@ -87,14 +270,14 @@ class GemmaApiProvider(BaseAIProvider):
         if not client:
             return findings
 
-        chunk = findings[:10]
+        chunk = findings[:6]
         findings_payload = [
             {
                 "id": f.id,
                 "category": f.category.value,
-                "title": f.title,
+                "title": f.title[:150],
                 "file_path": f.file_path,
-                "evidence": f.evidence[:150],
+                "evidence": (f.evidence or "")[:150],
                 "severity": f.severity.value,
             }
             for f in chunk
@@ -112,12 +295,15 @@ class GemmaApiProvider(BaseAIProvider):
             f"Respond with ONLY the JSON array."
         )
 
-        with agent_stage_span("Hosted Gemma Prioritization", run_id=run_id, provider=self.name, model=self.model):
+        with agent_stage_span(
+            "Hosted Gemma Prioritization",
+            op="quietpatch.gemma_analysis",
+            run_id=run_id,
+            provider=self.name,
+            model=self.model
+        ) as span:
             try:
-                response = client.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                )
+                response = self._generate_with_retry(prompt, client, span=span, max_output_tokens=1024)
                 text = response.text.strip()
                 if text.startswith("```"):
                     text = text.strip("`").replace("json\n", "", 1).strip()
@@ -136,8 +322,20 @@ class GemmaApiProvider(BaseAIProvider):
                             f.ai_assisted = True
                             f.is_demo = False
                             f.ai_model = self.model
+
+                    evaluated_count = sum(1 for f in findings if f.ai_assisted)
+                    if evaluated_count > 0:
+                        span.set_outcome("completed")
+                        span.set_tag("findings_count", evaluated_count)
+                    else:
+                        span.set_outcome("failed", details="Zero findings evaluated from model response")
+                else:
+                    span.set_outcome("failed", details="Model response was not a JSON list")
             except Exception as e:
-                logger.warning("Hosted Gemma call failed: %s", e)
+                sanitized_err = sanitize_error_message(str(e))
+                logger.warning("Hosted Gemma analysis failed: %s", sanitized_err)
+                span.set_outcome("failed", details=sanitized_err)
+                span.set_tag("error_category", type(e).__name__)
 
         return findings
 
@@ -148,7 +346,7 @@ class GemmaApiProvider(BaseAIProvider):
         repo_path: Path,
         run_id: Optional[str] = None
     ) -> Optional[ProposedPatch]:
-        """Proposes a patch using hosted Gemma API."""
+        """Proposes a patch using hosted Gemma API with bounded payload, retries, and strict error handling."""
         if not self.api_key:
             return None
 
@@ -156,14 +354,17 @@ class GemmaApiProvider(BaseAIProvider):
         if not client:
             return None
 
+        bounded_content = self._bound_file_content(file_content, finding, max_chars=2000)
+        bounded_evidence = (finding.evidence or "")[:250]
+
         prompt = (
             f"{SYSTEM_INSTRUCTION}\n"
             f"Finding to fix:\n"
-            f"- Title: {finding.title}\n"
+            f"- Title: {finding.title[:150]}\n"
             f"- File: {finding.file_path}\n"
-            f"- Evidence: {finding.evidence}\n"
-            f"- Suggestion: {finding.suggested_action}\n\n"
-            f"Original file content:\n```\n{file_content[:4000]}\n```\n\n"
+            f"- Evidence: {bounded_evidence}\n"
+            f"- Suggestion: {(finding.suggested_action or '')[:200]}\n\n"
+            f"Original file content:\n```\n{bounded_content}\n```\n\n"
             f"Propose the updated complete file content that addresses this finding with minimal disruption.\n"
             f"Return JSON:\n"
             f"{{\n"
@@ -175,12 +376,16 @@ class GemmaApiProvider(BaseAIProvider):
             f"}}"
         )
 
-        with agent_stage_span("Hosted Gemma Patch Generation", run_id=run_id, provider=self.name, model=self.model):
+        with agent_stage_span(
+            "Hosted Gemma Patch Generation",
+            op="quietpatch.patch_generation",
+            run_id=run_id,
+            provider=self.name,
+            model=self.model,
+            extra_tags={"finding_id": finding.id},
+        ) as span:
             try:
-                response = client.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                )
+                response = self._generate_with_retry(prompt, client, span=span, max_output_tokens=2048)
                 text = response.text.strip()
                 if text.startswith("```"):
                     text = text.strip("`").replace("json\n", "", 1).strip()
@@ -193,7 +398,7 @@ class GemmaApiProvider(BaseAIProvider):
                         fromfile=f"a/{finding.file_path}",
                         tofile=f"b/{finding.file_path}",
                     ))
-                    return ProposedPatch(
+                    patch = ProposedPatch(
                         id=f"patch-{finding.id}",
                         finding_id=finding.id,
                         file_path=finding.file_path,
@@ -208,7 +413,15 @@ class GemmaApiProvider(BaseAIProvider):
                         is_demo=False,
                         ai_model=self.model,
                     )
+                    span.set_outcome("completed")
+                    span.set_tag("patches_count", 1)
+                    return patch
+                else:
+                    span.set_outcome("failed", details="Model response contained no patch diff")
+                    return None
             except Exception as e:
-                logger.warning("Hosted Gemma patch generation failed: %s", e)
-
-        return None
+                sanitized_err = sanitize_error_message(str(e))
+                logger.warning("Hosted Gemma patch generation failed for %s: %s", finding.id, sanitized_err)
+                span.set_outcome("failed", details=sanitized_err)
+                span.set_tag("error_category", type(e).__name__)
+                return None

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import React from 'react';
 import { SeverityBadge, CategoryBadge, VerificationBadge } from './components/Badge';
@@ -157,6 +157,51 @@ describe('Header AI Provider Status Component', () => {
       />
     );
     expect(screen.getByText(/Offline \(gemma4:e4b\)/i)).toBeDefined();
+  });
+});
+
+describe('API Error Handling and Display', () => {
+  it('extracts structured JSON error message on upstream 503/500 error', async () => {
+    const { api } = await import('./api/client');
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => ({
+        error: 'Hosted Gemma model is temporarily unavailable (upstream HTTP 500). Please retry in a few moments.',
+        error_type: 'upstream_transient_error',
+      }),
+      text: async () => '',
+    }) as any;
+
+    try {
+      await expect(api.startScan('sample', 'sample-repo')).rejects.toThrow(
+        /Hosted Gemma model is temporarily unavailable/
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('falls back to non-HTML text when response is not JSON', async () => {
+    const { api } = await import('./api/client');
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 502,
+      json: async () => {
+        throw new Error('Unexpected token');
+      },
+      text: async () => 'Bad Gateway: Upstream connection failed',
+    }) as any;
+
+    try {
+      await expect(api.startScan('sample', 'sample-repo')).rejects.toThrow(
+        /Bad Gateway: Upstream connection failed/
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 

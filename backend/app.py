@@ -297,16 +297,36 @@ def create_app() -> Flask:
             except Exception:
                 pass
 
-        agent = AgentService(provider_name=target_run.ai_provider)
-        patch = agent.provider.propose_patch(
-            finding=target_finding,
-            file_content=file_content,
-            repo_path=repo_path,
-            run_id=target_run.id,
-        )
+        try:
+            agent = AgentService(provider_name=target_run.ai_provider)
+            patch = agent.provider.propose_patch(
+                finding=target_finding,
+                file_content=file_content,
+                repo_path=repo_path,
+                run_id=target_run.id,
+            )
+        except Exception as e:
+            from backend.ai.gemma_api_provider import GemmaApiTransientError, GemmaApiError
+            if isinstance(e, GemmaApiTransientError):
+                return jsonify({
+                    "error": "Hosted Gemma model is temporarily unavailable (upstream HTTP 500). Please retry in a few moments.",
+                    "status": 503,
+                    "error_type": "upstream_transient_error",
+                }), 503
+            if isinstance(e, GemmaApiError):
+                return jsonify({
+                    "error": f"Hosted Gemma error: {e.sanitized_message}",
+                    "status": 502,
+                    "error_type": "upstream_error",
+                }), 502
+            logger.error("Error proposing patch for %s: %s", finding_id, e, exc_info=True)
+            return jsonify({
+                "error": "Failed to propose fix due to an internal error.",
+                "status": 500,
+            }), 500
 
         if not patch:
-            return jsonify({"error": "AI provider was unable to generate a valid patch."}), 422
+            return jsonify({"error": "AI provider was unable to generate a valid patch diff for this finding."}), 422
 
         # Add or update patch in run
         existing_idx = next((i for i, p in enumerate(target_run.patches) if p.id == patch.id), -1)
@@ -440,6 +460,53 @@ def create_app() -> Flask:
             "mode": Config.APP_MODE,
             "provider": Config.AI_PROVIDER,
         }), 200
+
+    # =========================================================================
+    # Global Error Handlers (Sanitized JSON instead of default HTML)
+    # =========================================================================
+
+    @app.errorhandler(500)
+    def handle_internal_server_error(e):
+        """Catches unhandled 500 errors and returns sanitized JSON instead of default HTML."""
+        logger.error("Internal Server Error (HTTP 500): %s", e, exc_info=True)
+        return jsonify({
+            "error": "An internal server error occurred while processing the request.",
+            "status": 500,
+            "error_type": "internal_server_error",
+        }), 500
+
+    @app.errorhandler(Exception)
+    def handle_uncaught_exception(e):
+        """Global exception handler ensuring all uncaught API errors return sanitized JSON."""
+        from werkzeug.exceptions import HTTPException
+        if isinstance(e, HTTPException):
+            return jsonify({
+                "error": e.description,
+                "status": e.code,
+            }), e.code
+
+        logger.error("Unhandled API exception: %s", e, exc_info=True)
+        from backend.ai.gemma_api_provider import GemmaApiTransientError, GemmaApiError
+        if isinstance(e, GemmaApiTransientError):
+            return jsonify({
+                "error": "Hosted Gemma model is temporarily unavailable (upstream HTTP 500). Please retry in a few moments.",
+                "status": 503,
+                "error_type": "upstream_transient_error",
+                "provider": "gemma_api",
+            }), 503
+        if isinstance(e, GemmaApiError):
+            return jsonify({
+                "error": f"Hosted Gemma error: {e.sanitized_message}",
+                "status": 502,
+                "error_type": "upstream_error",
+                "provider": "gemma_api",
+            }), 502
+
+        return jsonify({
+            "error": "The QuietPatch server encountered an internal error. Please check server logs.",
+            "status": 500,
+            "error_type": "internal_error",
+        }), 500
 
     return app
 
