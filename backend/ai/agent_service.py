@@ -384,24 +384,24 @@ class AgentService:
                             elif new_patches_count > 0:
                                 patch_span.set_outcome(
                                     "partial",
-                                    details=f"Proposed {len(patches)}/{attempted_count} patches ({failed_count} failed)",
+                                    details=f"Proposed {new_patches_count}/{attempted_count} patches ({failed_count} failed, {len(patches)} total reviewable)",
                                 )
                                 record_stage(
                                     "proposal",
                                     "partial",
                                     prop_duration,
-                                    f"Proposed {len(patches)}/{attempted_count} patches ({failed_count} patch generation attempts failed)",
+                                    f"Proposed {new_patches_count}/{attempted_count} patches ({failed_count} patch generation attempts failed, {len(patches)} total reviewable)",
                                 )
                             else:
                                 patch_span.set_outcome(
-                                    "failed",
-                                    details=f"All {attempted_count} patch generation attempts failed",
+                                    "failed" if len(patches) == 0 else "partial",
+                                    details=f"All {attempted_count} patch generation attempts failed ({len(patches)} previously preserved)",
                                 )
                                 record_stage(
                                     "proposal",
-                                    "failed",
+                                    "failed" if len(patches) == 0 else "partial",
                                     prop_duration,
-                                    f"Patch generation failed for all {attempted_count} eligible findings",
+                                    f"Patch generation failed for all {attempted_count} eligible findings ({len(patches)} preserved)",
                                 )
 
                 # Stage 7: quietpatch.verification
@@ -460,7 +460,15 @@ class AgentService:
                 run_tracer.set_tag("findings_count", len(run.findings))
                 run_tracer.set_tag("patches_count", len(run.patches))
                 run_tracer.set_tag("time_saved_minutes", run.time_saved_minutes)
-                run_tracer.set_tag("stage_status", "completed")
+                has_partial = any(s.status == "partial" for s in run.stages.values())
+                has_failed = any(s.status == "failed" for s in run.stages.values())
+                if has_failed:
+                    overall_stage_status = "partial" if (len(run.patches) > 0 or any(f.ai_assisted for f in run.findings)) else "failed"
+                elif has_partial:
+                    overall_stage_status = "partial"
+                else:
+                    overall_stage_status = "completed"
+                run_tracer.set_tag("stage_status", overall_stage_status)
                 run_tracer.set_status("ok")
 
             except Exception as exc:
@@ -650,14 +658,14 @@ class AgentService:
                         )
                     else:
                         patch_span.set_outcome(
-                            "failed",
-                            details=f"All {attempted_count} patch generation attempts failed",
+                            "failed" if len(patches) == 0 else "partial",
+                            details=f"All {attempted_count} patch generation attempts failed ({len(patches)} previously preserved)",
                         )
                         run.stages["proposal"] = StageRecord(
                             name="proposal",
-                            status="failed",
+                            status="failed" if len(patches) == 0 else "partial",
                             duration_seconds=1.0,
-                            details=f"Patch generation failed for all {attempted_count} eligible findings (retry)",
+                            details=f"Patch generation failed for all {attempted_count} eligible findings (retry, {len(patches)} preserved)",
                             completed_at=datetime.now(timezone.utc).isoformat(),
                         )
 

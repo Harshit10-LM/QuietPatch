@@ -484,9 +484,10 @@ class GemmaApiProvider(BaseAIProvider):
                 from google import genai
                 # Configure single attempt (disable SDK internal retries) so our application
                 # bounded retry policy controls all retries with timing, backoff, and observability.
+                req_timeout_ms = max(1000, int(Config.GEMMA_API_REQUEST_TIMEOUT_SECONDS * 1000))
                 http_options = genai.types.HttpOptions(
                     retry_options=genai.types.HttpRetryOptions(attempts=1),
-                    timeout=45000,
+                    timeout=req_timeout_ms,
                 )
                 self._client = genai.Client(api_key=self.api_key, http_options=http_options)
             except Exception as e:
@@ -538,38 +539,53 @@ class GemmaApiProvider(BaseAIProvider):
         time_budget_seconds: Optional[float] = None,
     ) -> Any:
         """Executes generate_content with bounded retries, exponential backoff with jitter,
-        Retry-After adherence, and overall time budget for transient errors.
+        Retry-After adherence, per-request explicit timeouts, and overall time budget for transient errors.
         """
-        config = None
-        try:
-            from google import genai
-            config = genai.types.GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=max_output_tokens,
-            )
-        except Exception:
-            pass
-
         budget = float(time_budget_seconds if time_budget_seconds is not None else Config.GEMMA_API_RETRY_BUDGET_SECONDS)
         start_time = time.time()
         last_error = None
         last_code = None
         total_attempts = self.max_retries + 1
+        safety_margin = 0.5  # seconds reserved for exception handling, logging, and Sentry
 
         for attempt in range(1, total_attempts + 1):
             elapsed = time.time() - start_time
-            if attempt > 1 and elapsed >= budget:
+            remaining_budget = budget - elapsed
+
+            # Budget check BEFORE starting attempt
+            if remaining_budget <= safety_margin:
                 logger.warning(
-                    "Hosted Gemma retry budget exceeded (%.2fs >= %.2fs) on attempt %d/%d",
-                    elapsed, budget, attempt, total_attempts
+                    "Hosted Gemma retry budget exhausted (remaining %.2fs <= safety margin %.2fs) before attempt %d/%d (total elapsed %.2fs)",
+                    remaining_budget, safety_margin, attempt, total_attempts, elapsed
                 )
                 if span:
                     span.set_tag("error_category", "transient_api_error")
                     span.set_data("time_budget_exhausted", True)
+                    span.set_data("remaining_budget", round(remaining_budget, 2))
                 raise GemmaApiTransientError(
                     f"Gemma API retry time budget exhausted after {elapsed:.1f}s ({attempt - 1} retries): {sanitize_error_message(str(last_error))}",
                     code=last_code or 500,
                 )
+
+            # Enforce real, bounded request timeout in milliseconds based on remaining budget
+            configured_req_timeout = float(Config.GEMMA_API_REQUEST_TIMEOUT_SECONDS)
+            allowed_req_timeout = max(0.5, min(configured_req_timeout, remaining_budget - safety_margin))
+            req_timeout_ms = max(500, int(allowed_req_timeout * 1000))
+
+            config = None
+            try:
+                from google import genai
+                http_options = genai.types.HttpOptions(
+                    timeout=req_timeout_ms,
+                    retry_options=genai.types.HttpRetryOptions(attempts=1),
+                )
+                config = genai.types.GenerateContentConfig(
+                    temperature=0.2,
+                    max_output_tokens=max_output_tokens,
+                    http_options=http_options,
+                )
+            except Exception:
+                pass
 
             t_req = time.time()
             try:
@@ -622,14 +638,15 @@ class GemmaApiProvider(BaseAIProvider):
 
                 ra = extract_retry_after(exc)
                 if ra is not None:
-                    delay = min(max(0.5, ra), 10.0)
+                    delay = max(0.5, ra)
                 else:
                     delay = min(8.0, (self.backoff_factor * (2 ** (attempt - 1))) + random.uniform(0.1, 0.4))
 
-                if (time.time() - start_time) + delay > budget:
+                remaining_after_delay = budget - (time.time() - start_time + delay)
+                if remaining_after_delay <= safety_margin:
                     logger.warning(
-                        "Hosted Gemma retry delay (%.2fs) would exceed remaining time budget (total %.2fs). Aborting retries.",
-                        delay, budget
+                        "Hosted Gemma retry delay (%.2fs) would exceed remaining time budget (total %.2fs, remaining after delay %.2fs). Aborting retries.",
+                        delay, budget, remaining_after_delay
                     )
                     if span:
                         span.set_tag("error_category", "transient_api_error")
@@ -664,6 +681,11 @@ class GemmaApiProvider(BaseAIProvider):
                 if evidence_snippet[:40] in line:
                     target_idx = idx
                     break
+
+        if target_idx < 0 and getattr(finding, "line_number", None):
+            ln = finding.line_number
+            if isinstance(ln, int) and 1 <= ln <= len(lines):
+                target_idx = ln - 1
 
         if target_idx >= 0:
             start_line = max(0, target_idx - 25)
@@ -928,17 +950,23 @@ class GemmaApiProvider(BaseAIProvider):
             f"}}"
         )
 
+        patch_budget = float(Config.GEMMA_API_PATCH_TIMEOUT_SECONDS)
+        t_patch_start = time.time()
+
         with agent_stage_span(
             "Hosted Gemma Patch Generation",
             op="quietpatch.patch_generation",
             run_id=run_id,
             provider=self.name,
             model=self.model,
-            extra_tags={"finding_id": finding.id},
+            extra_tags={"finding_id": finding.id, "patch_budget_seconds": patch_budget},
         ) as span:
             try:
-                initial_max_tokens = Config.GEMMA_API_MAX_OUTPUT_TOKENS
-                response = self._generate_with_retry(prompt, client, span=span, max_output_tokens=initial_max_tokens)
+                initial_max_tokens = Config.GEMMA_API_PATCH_MAX_OUTPUT_TOKENS
+                initial_budget = min(Config.GEMMA_API_RETRY_BUDGET_SECONDS, patch_budget)
+                response = self._generate_with_retry(
+                    prompt, client, span=span, max_output_tokens=initial_max_tokens, time_budget_seconds=initial_budget
+                )
                 diag = extract_response_diagnostics(response, max_expected_tokens=initial_max_tokens)
 
                 data = None
@@ -973,9 +1001,23 @@ class GemmaApiProvider(BaseAIProvider):
                             f"Hosted Gemma patch response non-recoverable ({diag.failure_category}): {diag.sanitized_summary()}"
                         )
 
-                    # Controlled bounded recovery attempt (at most 1)
+                    # Controlled bounded recovery attempt (at most 1) sharing the remaining patch budget
+                    elapsed_so_far = time.time() - t_patch_start
+                    remaining_for_recovery = patch_budget - elapsed_so_far
+
+                    if remaining_for_recovery < 5.0:
+                        logger.warning(
+                            "Insufficient remaining patch budget (%.2fs < 5.0s) for recovery on finding %s. Skipping recovery.",
+                            remaining_for_recovery, finding.id
+                        )
+                        span.set_data("recovery_attempted", False)
+                        span.set_data("recovery_outcome", "skipped_insufficient_budget")
+                        raise GemmaApiResponseError(
+                            f"Hosted Gemma patch recovery skipped due to budget exhaustion ({diag.failure_category}): {diag.sanitized_summary()}"
+                        )
+
                     recovery_attempts = 1
-                    recovery_max_tokens = Config.GEMMA_API_RECOVERY_MAX_TOKENS
+                    recovery_max_tokens = Config.GEMMA_API_PATCH_RECOVERY_MAX_TOKENS
                     if diag.failure_category in {"output_truncated", "output_token_truncated"}:
                         reduced_content = self._bound_file_content(file_content, finding, max_chars=800)
                         recovery_prompt = (
@@ -1001,11 +1043,11 @@ class GemmaApiProvider(BaseAIProvider):
                             "CRITICAL: Output ONLY a valid JSON object adhering to the schema without markdown code blocks."
                         )
                     logger.info(
-                        "Hosted Gemma patch recoverable response (%s). Attempting bounded recovery (1/1)...",
-                        diag.failure_category,
+                        "Hosted Gemma patch recoverable response (%s). Attempting bounded recovery (1/1) with %.2fs remaining budget...",
+                        diag.failure_category, remaining_for_recovery
                     )
                     rec_response = self._generate_with_retry(
-                        recovery_prompt, client, span=span, max_output_tokens=recovery_max_tokens
+                        recovery_prompt, client, span=span, max_output_tokens=recovery_max_tokens, time_budget_seconds=remaining_for_recovery
                     )
                     rec_diag = extract_response_diagnostics(rec_response, max_expected_tokens=recovery_max_tokens)
 

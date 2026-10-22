@@ -55,6 +55,22 @@ class Config:
         GEMMA_API_RETRY_BUDGET_SECONDS = float(os.getenv("GEMMA_API_RETRY_BUDGET_SECONDS", "30.0"))
     except ValueError:
         GEMMA_API_RETRY_BUDGET_SECONDS = 30.0
+    try:
+        GEMMA_API_REQUEST_TIMEOUT_SECONDS = float(os.getenv("GEMMA_API_REQUEST_TIMEOUT_SECONDS", "15.0"))
+    except ValueError:
+        GEMMA_API_REQUEST_TIMEOUT_SECONDS = 15.0
+    try:
+        GEMMA_API_PATCH_TIMEOUT_SECONDS = float(os.getenv("GEMMA_API_PATCH_TIMEOUT_SECONDS", "35.0"))
+    except ValueError:
+        GEMMA_API_PATCH_TIMEOUT_SECONDS = 35.0
+    try:
+        GEMMA_API_PATCH_MAX_OUTPUT_TOKENS = int(os.getenv("GEMMA_API_PATCH_MAX_OUTPUT_TOKENS", "2048"))
+    except ValueError:
+        GEMMA_API_PATCH_MAX_OUTPUT_TOKENS = 2048
+    try:
+        GEMMA_API_PATCH_RECOVERY_MAX_TOKENS = int(os.getenv("GEMMA_API_PATCH_RECOVERY_MAX_TOKENS", "1536"))
+    except ValueError:
+        GEMMA_API_PATCH_RECOVERY_MAX_TOKENS = 1536
 
     # Security Boundaries
     default_allowed_root = str(BASE_DIR.resolve())
@@ -98,6 +114,10 @@ class Config:
             "gemma_api_recovery_max_tokens": cls.GEMMA_API_RECOVERY_MAX_TOKENS,
             "gemma_api_batch_size": cls.GEMMA_API_BATCH_SIZE,
             "gemma_api_retry_budget_seconds": cls.GEMMA_API_RETRY_BUDGET_SECONDS,
+            "gemma_api_request_timeout_seconds": cls.GEMMA_API_REQUEST_TIMEOUT_SECONDS,
+            "gemma_api_patch_timeout_seconds": cls.GEMMA_API_PATCH_TIMEOUT_SECONDS,
+            "gemma_api_patch_max_output_tokens": cls.GEMMA_API_PATCH_MAX_OUTPUT_TOKENS,
+            "gemma_api_patch_recovery_max_tokens": cls.GEMMA_API_PATCH_RECOVERY_MAX_TOKENS,
             "allowed_root": str(cls.QUIETPATCH_ALLOWED_ROOT),
             "sentry_configured": bool(cls.SENTRY_DSN),
             "sentry_environment": cls.SENTRY_ENVIRONMENT,

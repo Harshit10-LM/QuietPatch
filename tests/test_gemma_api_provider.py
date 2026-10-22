@@ -1389,3 +1389,210 @@ def test_multibatch_partial_success_preserves_successful_findings_and_patches(tm
     # Proposals generated for assisted findings MUST be preserved
     assert len(run.patches) >= 1
     assert run.patches[0].finding_id == "f1"
+
+
+def test_sdk_request_timeout_bounded_to_remaining_budget():
+    """3. An SDK request cannot silently exceed the remaining configured budget."""
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.text = '{"status": "ok"}'
+    mock_client.models.generate_content.return_value = mock_resp
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+
+    with patch.object(Config, "GEMMA_API_REQUEST_TIMEOUT_SECONDS", 15.0):
+        # When budget is 10s, allowed request timeout must be bounded to <= 9500ms (10s - 0.5s safety margin)
+        provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=10.0)
+
+        call_kwargs = mock_client.models.generate_content.call_args.kwargs
+        passed_config = call_kwargs.get("config")
+        assert passed_config is not None
+        assert passed_config.http_options is not None
+        # Must be bounded by remaining budget minus safety margin: min(15000, 10000 - 500) = 9500ms
+        assert passed_config.http_options.timeout <= 9500
+        assert passed_config.http_options.retry_options.attempts == 1
+
+
+def test_http_504_retries_stop_when_wall_clock_budget_expires():
+    """2. HTTP 504 retries stop strictly when the real wall-clock budget expires."""
+    mock_client = MagicMock()
+    err_504 = genai_errors.ServerError(504, "Gateway Timeout / DEADLINE_EXCEEDED")
+
+    current_virtual_time = 1000.0
+
+    def fake_time():
+        nonlocal current_virtual_time
+        return current_virtual_time
+
+    def fake_sleep(seconds):
+        nonlocal current_virtual_time
+        current_virtual_time += seconds
+
+    def side_effect_504(**kwargs):
+        nonlocal current_virtual_time
+        # Simulate request taking 12 seconds before returning 504
+        current_virtual_time += 12.0
+        raise err_504
+
+    mock_client.models.generate_content.side_effect = side_effect_504
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=3, backoff_factor=1.0)
+    provider._client = mock_client
+
+    with patch("time.time", side_effect=fake_time), \
+         patch("time.sleep", side_effect=fake_sleep), \
+         patch.object(Config, "GEMMA_API_REQUEST_TIMEOUT_SECONDS", 15.0), \
+         patch.object(Config, "GEMMA_API_RETRY_BUDGET_SECONDS", 20.0):
+
+        with pytest.raises(GemmaApiTransientError) as exc_info:
+            provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=20.0)
+
+        # After attempt 1 took 12s, attempt 2 had 8s budget remaining.
+        # Delay would be 1s, leaving 7s. Attempt 2 took 12s -> total time 25s >= 20s.
+        # Retries MUST abort and report budget exhausted
+        assert "time budget exhausted" in str(exc_info.value).lower()
+        # Retries stopped; did not run all 4 attempts (1 + 3 retries)
+        assert mock_client.models.generate_content.call_count < 4
+
+
+def test_retry_after_delay_cannot_exceed_remaining_budget():
+    """7. Retry-After delays cannot exceed the remaining budget."""
+    mock_client = MagicMock()
+    err_429 = genai_errors.APIError(429, "Resource exhausted")
+    mock_resp = MagicMock()
+    mock_resp.headers = {"Retry-After": "25"}  # Upstream wants 25s wait
+    err_429.response = mock_resp
+    mock_client.models.generate_content.side_effect = err_429
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=2)
+    provider._client = mock_client
+
+    with patch.object(Config, "GEMMA_API_RETRY_BUDGET_SECONDS", 10.0):
+        with pytest.raises(GemmaApiTransientError) as exc_info:
+            provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=10.0)
+
+        # Since 25s delay exceeds 10s budget, retries must abort immediately on attempt 1
+        assert "time budget exhausted" in str(exc_info.value).lower()
+        assert mock_client.models.generate_content.call_count == 1
+
+
+def test_patch_proposal_shares_patch_budget_and_skips_recovery_if_insufficient_time(tmp_path):
+    """4 & 5. Patch proposal shares budget across initial call and recovery, skipping recovery if remaining time is too low."""
+    mock_client = MagicMock()
+    # Response is truncated with MAX_TOKENS
+    mock_trunc = MagicMock()
+    mock_trunc.text = '{"incomplete":'
+    mock_trunc.candidates = [
+        MagicMock(finish_reason="MAX_TOKENS", content=MagicMock(parts=[MagicMock(text='{"incomplete":', thought=False)]))
+    ]
+    mock_client.models.generate_content.return_value = mock_trunc
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-trunc",
+        category=FindingCategory.CONFIGURATION,
+        title="Truncated finding",
+        file_path="config.py",
+        evidence="api_key = ''",
+        explanation="Needs key",
+        suggested_action="Add key",
+    )
+
+    current_time = 1000.0
+
+    def fake_time():
+        nonlocal current_time
+        return current_time
+
+    # Simulate initial call taking 32 seconds of a 35s patch budget
+    def side_effect_slow(**kwargs):
+        nonlocal current_time
+        current_time += 32.0
+        return mock_trunc
+
+    mock_client.models.generate_content.side_effect = side_effect_slow
+
+    with patch("time.time", side_effect=fake_time), \
+         patch.object(Config, "GEMMA_API_PATCH_TIMEOUT_SECONDS", 35.0):
+
+        patch_obj = provider.propose_patch(finding, "original content", tmp_path)
+
+        # Patch proposal returns None without crashing
+        assert patch_obj is None
+        # Only 1 generate_content call was made because remaining budget (3s) was < 5s threshold!
+        assert mock_client.models.generate_content.call_count == 1
+
+
+def test_failed_patch_does_not_erase_successful_patches_and_records_partial(tmp_path):
+    """5, 6 & 9. A failed patch does not erase other successful patches; marks proposal PARTIAL and root tag PARTIAL."""
+    f1 = Finding(id="f1", category=FindingCategory.CONFIGURATION, title="Fix 1", file_path="a.py", evidence="x=1", explanation="e1", suggested_action="a1", ai_assisted=True)
+    f2 = Finding(id="f2", category=FindingCategory.CONFIGURATION, title="Fix 2", file_path="b.py", evidence="y=2", explanation="e2", suggested_action="a2", ai_assisted=True)
+    f3 = Finding(id="f3", category=FindingCategory.CONFIGURATION, title="Fix 3", file_path="c.py", evidence="z=3", explanation="e3", suggested_action="a3", ai_assisted=True)
+
+    for name in ["a.py", "b.py", "c.py"]:
+        p = tmp_path / name
+        p.write_text("x = 1\n", encoding="utf-8")
+
+    mock_client = MagicMock()
+
+    # Finding 1 patch succeeds
+    patch1_resp = MagicMock()
+    patch1_resp.text = json.dumps({
+        "change_summary": "Update a.py",
+        "proposed_content": "x = 42\n",
+        "explanation": "Fixed",
+        "risks_assumptions": "none",
+        "suggested_verification": "pytest",
+    })
+
+    # Finding 2 patch fails (504 timeout)
+    err_504 = genai_errors.ServerError(504, "Gateway Timeout")
+
+    # Finding 3 patch succeeds
+    patch3_resp = MagicMock()
+    patch3_resp.text = json.dumps({
+        "change_summary": "Update c.py",
+        "proposed_content": "z = 99\n",
+        "explanation": "Fixed",
+        "risks_assumptions": "none",
+        "suggested_verification": "pytest",
+    })
+
+    # Call side effects: f1 -> patch1_resp; f2 -> err_504 exhausted; f3 -> patch3_resp
+    mock_client.models.generate_content.side_effect = [
+        patch1_resp,
+        err_504, err_504,  # f2 retries fail
+        patch3_resp,
+    ]
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=1, backoff_factor=0.01)
+    provider._client = mock_client
+
+    agent = AgentService(provider_name="gemma_api")
+    agent.provider = provider
+
+    with patch.object(agent.scan_engine, "discover_files", return_value=([tmp_path / "a.py"], 10)), \
+         patch.object(agent.scan_engine, "run_scanners", return_value=([f1, f2, f3], {})), \
+         patch.object(provider, "analyze_and_prioritize", return_value=[f1, f2, f3]):
+
+        run = agent.execute_maintenance_run(
+            repo_path=tmp_path,
+            repo_name="PatchTestRepo",
+            repo_type="local",
+            run_id="run-patch-partial",
+        )
+
+    # 2 patches were proposed, 1 failed
+    assert len(run.patches) == 2
+    assert {p.finding_id for p in run.patches} == {"f1", "f3"}
+
+    # Proposal stage must be PARTIAL
+    assert run.stages["proposal"].status == "partial"
+    assert "2/3" in run.stages["proposal"].details
+    assert "1 patch generation attempts failed" in run.stages["proposal"].details
+
+    # Overall run is completed with partial stage
+    assert run.status == "completed"
+

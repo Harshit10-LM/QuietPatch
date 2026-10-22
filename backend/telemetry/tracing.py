@@ -26,6 +26,7 @@ SAFE_TAG_KEYS = {
     "attempted_count", "failed_count", "successful_batches", "failed_batches",
     "is_retry", "is_transient", "exhausted_attempts", "error_code",
     "successful_attempt", "time_budget_exhausted", "finding_id",
+    "patch_budget_seconds", "remaining_budget", "request_timeout_ms", "recovery_tokens",
 }
 
 # Mapping of human-friendly stage names to required quietpatch span operations
