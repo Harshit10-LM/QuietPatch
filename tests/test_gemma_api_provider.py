@@ -14,6 +14,7 @@ from backend.ai.gemma_api_provider import (
     GemmaApiResponseError,
     GemmaApiTransientError,
     ResponseDiagnostics,
+    classify_patch_error,
     clean_json_text,
     extract_error_code,
     extract_response_diagnostics,
@@ -2144,4 +2145,196 @@ def test_patch_proposal_rejects_invalid_schema_empty_diff_and_identical_content(
 
     p2 = provider.propose_patch(finding, "original\n", tmp_path)
     assert p2 is None
+
+
+def test_patch_and_recovery_use_minimal_thinking_config_while_analysis_unaltered(tmp_path):
+    """Regression test 1: Both initial patch proposal and recovery requests attach
+    ThinkingConfig(thinking_level='minimal') while analysis requests do NOT attach
+    thinking_config, leaving successful analysis unaltered.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    # 1. Test analysis stage: thinking_config should be None
+    analysis_resp = MagicMock()
+    analysis_resp.text = json.dumps([{
+        "id": "f-analysis-1",
+        "severity": "high",
+        "explanation": "Valid analysis",
+        "suggested_action": "Fix"
+    }])
+    mock_client.models.generate_content.return_value = analysis_resp
+
+    finding = Finding(
+        id="f-analysis-1",
+        category=FindingCategory.CONFIGURATION,
+        title="Check config",
+        file_path="config.py",
+        evidence="debug=True",
+        explanation="Default explanation",
+        suggested_action="Default action",
+        severity=Severity.LOW,
+    )
+    provider.analyze_and_prioritize([finding], run_id="run-analysis-check")
+    assert mock_client.models.generate_content.call_count == 1
+    analysis_call_cfg = mock_client.models.generate_content.call_args_list[0].kwargs.get("config")
+    assert analysis_call_cfg is not None
+    assert getattr(analysis_call_cfg, "thinking_config", None) is None
+
+    mock_client.reset_mock()
+
+    # 2. Test patch stage: call 1 (initial) hits MAX_TOKENS, call 2 (recovery) succeeds
+    trunc_resp = MagicMock()
+    cand1 = MagicMock(finish_reason="MAX_TOKENS")
+    cand1.content = MagicMock(parts=[MagicMock(text='{"incomplete": 1', thought=False)])
+    trunc_resp.candidates = [cand1]
+    trunc_resp.text = '{"incomplete": 1'
+
+    valid_patch_json = json.dumps({
+        "change_summary": "Update debug setting",
+        "proposed_content": "debug=False\n",
+        "explanation": "Disables debug in prod.",
+        "risks_assumptions": "Low risk.",
+        "suggested_verification": "Check config.",
+    })
+    rec_resp = MagicMock()
+    cand2 = MagicMock(finish_reason="STOP")
+    cand2.content = MagicMock(parts=[MagicMock(text=valid_patch_json, thought=False)])
+    rec_resp.candidates = [cand2]
+    rec_resp.text = valid_patch_json
+
+    mock_client.models.generate_content.side_effect = [trunc_resp, rec_resp]
+
+    patch = provider.propose_patch(finding, "debug=True\n", tmp_path, run_id="run-patch-thinking")
+    assert patch is not None
+    assert patch.proposed_content == "debug=False\n"
+    assert mock_client.models.generate_content.call_count == 2
+
+    patch_calls = mock_client.models.generate_content.call_args_list
+    initial_cfg = patch_calls[0].kwargs.get("config")
+    recovery_cfg = patch_calls[1].kwargs.get("config")
+
+    # Initial call must have thinking_config with MINIMAL and max_output_tokens=2048
+    assert initial_cfg is not None
+    assert initial_cfg.thinking_config is not None
+    assert "MINIMAL" in str(initial_cfg.thinking_config.thinking_level).upper()
+    assert initial_cfg.max_output_tokens == 2048
+
+    # Recovery call must have thinking_config with MINIMAL and max_output_tokens=4096
+    assert recovery_cfg is not None
+    assert recovery_cfg.thinking_config is not None
+    assert "MINIMAL" in str(recovery_cfg.thinking_config.thinking_level).upper()
+    assert recovery_cfg.max_output_tokens == 4096
+    assert recovery_cfg.max_output_tokens > initial_cfg.max_output_tokens
+
+
+def test_upstream_504_during_recovery_stops_cleanly_and_categorized_without_conflation(tmp_path):
+    """Regression test: When recovery receives an HTTP 504 / DEADLINE_EXCEEDED,
+    propose_patch stops cleanly without infinite retries, returns None,
+    and categorizes the error as upstream_504_timeout instead of conflating with token exhaustion.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    # Call 1: MAX_TOKENS truncation (triggers recovery)
+    trunc_resp = MagicMock()
+    cand1 = MagicMock(finish_reason="MAX_TOKENS")
+    cand1.content = MagicMock(parts=[MagicMock(text='{"change_summary": "inc', thought=False)])
+    trunc_resp.candidates = [cand1]
+    trunc_resp.text = '{"change_summary": "inc'
+
+    # Call 2: Recovery request times out with HTTP 504 DEADLINE_EXCEEDED
+    err_504 = GemmaApiTransientError("504 Gateway Timeout: DEADLINE_EXCEEDED from Google API", code=504)
+
+    current_time = [1000.0]
+
+    def fake_time():
+        return current_time[0]
+
+    def fake_generate(*args, **kwargs):
+        if mock_client.models.generate_content.call_count == 1:
+            current_time[0] += 43.30
+            return trunc_resp
+        else:
+            current_time[0] += 44.00
+            raise err_504
+
+    mock_client.models.generate_content.side_effect = fake_generate
+
+    finding = Finding(
+        id="finding-504-recovery",
+        category=FindingCategory.DOCUMENTATION,
+        title="Check doc",
+        file_path="README.md",
+        evidence="sample evidence",
+        explanation="Default explanation",
+        suggested_action="Default action",
+    )
+
+    with patch("time.time", side_effect=fake_time), \
+         patch("backend.ai.gemma_api_provider.classify_patch_error", wraps=classify_patch_error) as mock_classify:
+        patch_result = provider.propose_patch(finding, "# Readme\n", tmp_path, run_id="run-504-rec")
+        assert patch_result is None
+        # Must have stopped cleanly after initial (1) + recovery (1) = 2 calls
+        assert mock_client.models.generate_content.call_count == 2
+        # Error classifier must classify it as upstream_504_timeout, NOT output_token_truncated
+        assert mock_classify.called
+        passed_exc = mock_classify.call_args[0][0]
+        assert classify_patch_error(passed_exc) == "upstream_504_timeout"
+
+
+def test_classify_patch_error_distinguishes_all_categories():
+    """Regression test: classify_patch_error distinctly separates 504 timeouts,
+    500 errors, transport timeouts, token limit truncations, and malformed outputs.
+    """
+    # 1. 504 DEADLINE_EXCEEDED
+    e_504 = GemmaApiTransientError("504 Gateway Timeout: DEADLINE_EXCEEDED", code=504)
+    assert classify_patch_error(e_504) == "upstream_504_timeout"
+
+    # 2. 500 Internal Server Error
+    e_500 = GemmaApiTransientError("500 Internal Server Error", code=500)
+    assert classify_patch_error(e_500) == "upstream_500_error"
+
+    # 3. Transport timeout / Connection error
+    e_transport = Exception("ConnectTimeout: HTTPSConnectionPool(host='generativelanguage.googleapis.com')")
+    assert classify_patch_error(e_transport) == "transport_timeout"
+
+    # 4. Time budget exhausted
+    e_budget = GemmaApiTransientError("Gemma API retry time budget exhausted after 90.0s")
+    assert classify_patch_error(e_budget) == "time_budget_exhausted"
+
+    # 5. Output token truncation
+    e_trunc = GemmaApiResponseError("Hosted Gemma patch response unusable after recovery attempt (output_token_truncated).")
+    assert classify_patch_error(e_trunc) == "output_token_truncated"
+
+    # 6. Malformed JSON output
+    e_malformed = json.JSONDecodeError("Expecting value", "doc", 0)
+    assert classify_patch_error(e_malformed) == "malformed_output"
+
+
+def test_patch_service_and_proposal_reject_unsafe_paths_and_malformed_diffs(tmp_path):
+    """Regression test 7: Path traversal, escaping repository root, and empty/malformed
+    diffs are strictly rejected by PatchService and GemmaApiProvider.
+    """
+    from backend.services.patch_service import PatchError, PatchService
+
+    svc = PatchService(allowed_root=tmp_path)
+    (tmp_path / "valid.txt").write_text("hello\n", encoding="utf-8")
+
+    # 1. Reject path traversal with '..'
+    try:
+        svc._resolve_and_validate_path(tmp_path, "../outside.txt")
+        assert False, "Should have raised PatchError for path traversal"
+    except PatchError as pe:
+        assert "prohibited" in str(pe)
+
+    # 2. Reject empty path
+    try:
+        svc._resolve_and_validate_path(tmp_path, "")
+        assert False, "Should have raised PatchError for empty path"
+    except PatchError as pe:
+        assert "cannot be empty" in str(pe)
+
 

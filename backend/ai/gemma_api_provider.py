@@ -176,6 +176,30 @@ def extract_retry_after(exc: Exception) -> Optional[float]:
     return None
 
 
+def classify_patch_error(exc: Exception) -> str:
+    """Classifies exceptions from patch generation into distinct, non-conflated failure categories."""
+    msg = str(exc).lower()
+    exc_type = type(exc).__name__.lower()
+    code = getattr(exc, "code", None)
+    if code == 504 or "504" in msg or "deadline_exceeded" in msg or "deadline exceeded" in msg:
+        return "upstream_504_timeout"
+    if code == 500 or "500" in msg or "internal server error" in msg:
+        return "upstream_500_error"
+    if "connecttimeout" in msg or "readtimeout" in msg or "transport" in msg or "connection error" in msg:
+        return "transport_timeout"
+    if "budget exhausted" in msg or "budget insufficient" in msg or "time budget" in msg:
+        return "time_budget_exhausted"
+    if "output_token_truncated" in msg or "output_truncated" in msg or "max_tokens" in msg:
+        return "output_token_truncated"
+    if isinstance(exc, json.JSONDecodeError) or "malformed" in msg or "jsondecodeerror" in exc_type:
+        return "malformed_output"
+    if isinstance(exc, GemmaApiTransientError):
+        return "transient_api_error"
+    if isinstance(exc, GemmaApiResponseError):
+        return "malformed_output"
+    return "patch_generation_error"
+
+
 def extract_response_diagnostics(
     response: Any,
     max_expected_tokens: int = 2048,
@@ -549,6 +573,7 @@ class GemmaApiProvider(BaseAIProvider):
         span: Optional[Any] = None,
         max_output_tokens: int = 2048,
         time_budget_seconds: Optional[float] = None,
+        thinking_level: Optional[str] = None,
     ) -> Any:
         """Executes generate_content with bounded retries, exponential backoff with jitter,
         Retry-After adherence, per-request explicit timeouts, and overall time budget for transient errors.
@@ -594,11 +619,22 @@ class GemmaApiProvider(BaseAIProvider):
                     timeout=req_timeout_ms,
                     retry_options=genai.types.HttpRetryOptions(attempts=1),
                 )
-                config = genai.types.GenerateContentConfig(
-                    temperature=0.2,
-                    max_output_tokens=max_output_tokens,
-                    http_options=http_options,
-                )
+                thinking_config = None
+                if thinking_level:
+                    try:
+                        thinking_config = genai.types.ThinkingConfig(thinking_level=thinking_level)
+                    except Exception as tc_err:
+                        logger.debug("ThinkingConfig not supported or failed to initialize: %s", tc_err)
+
+                config_kwargs = {
+                    "temperature": 0.2,
+                    "max_output_tokens": max_output_tokens,
+                    "http_options": http_options,
+                }
+                if thinking_config is not None:
+                    config_kwargs["thinking_config"] = thinking_config
+
+                config = genai.types.GenerateContentConfig(**config_kwargs)
             except Exception:
                 pass
 
@@ -983,6 +1019,7 @@ class GemmaApiProvider(BaseAIProvider):
         )
 
         patch_budget = float(Config.GEMMA_API_PATCH_TIMEOUT_SECONDS)
+        patch_thinking_level = Config.GEMMA_API_PATCH_THINKING_LEVEL or "minimal"
         t_patch_start = time.time()
 
         with agent_stage_span(
@@ -991,13 +1028,22 @@ class GemmaApiProvider(BaseAIProvider):
             run_id=run_id,
             provider=self.name,
             model=self.model,
-            extra_tags={"finding_id": finding.id, "patch_budget_seconds": patch_budget},
+            extra_tags={
+                "finding_id": finding.id,
+                "patch_budget_seconds": patch_budget,
+                "thinking_level": patch_thinking_level,
+            },
         ) as span:
             try:
                 initial_max_tokens = Config.GEMMA_API_PATCH_MAX_OUTPUT_TOKENS
                 initial_budget = min(Config.GEMMA_API_RETRY_BUDGET_SECONDS, patch_budget)
                 response = self._generate_with_retry(
-                    prompt, client, span=span, max_output_tokens=initial_max_tokens, time_budget_seconds=initial_budget
+                    prompt,
+                    client,
+                    span=span,
+                    max_output_tokens=initial_max_tokens,
+                    time_budget_seconds=initial_budget,
+                    thinking_level=patch_thinking_level,
                 )
                 diag = extract_response_diagnostics(response, max_expected_tokens=initial_max_tokens)
 
@@ -1083,7 +1129,12 @@ class GemmaApiProvider(BaseAIProvider):
                         diag.failure_category, remaining_for_recovery
                     )
                     rec_response = self._generate_with_retry(
-                        recovery_prompt, client, span=span, max_output_tokens=recovery_max_tokens, time_budget_seconds=remaining_for_recovery
+                        recovery_prompt,
+                        client,
+                        span=span,
+                        max_output_tokens=recovery_max_tokens,
+                        time_budget_seconds=remaining_for_recovery,
+                        thinking_level=patch_thinking_level,
                     )
                     rec_diag = extract_response_diagnostics(rec_response, max_expected_tokens=recovery_max_tokens)
 
@@ -1167,7 +1218,9 @@ class GemmaApiProvider(BaseAIProvider):
                     return None
             except Exception as e:
                 sanitized_err = sanitize_error_message(str(e))
-                logger.warning("Hosted Gemma patch generation failed for %s: %s", finding.id, sanitized_err)
+                err_category = classify_patch_error(e)
+                logger.warning("Hosted Gemma patch generation failed for %s (%s): %s", finding.id, err_category, sanitized_err)
                 span.set_outcome("failed", details=sanitized_err)
-                span.set_tag("error_category", type(e).__name__)
+                span.set_tag("error_category", err_category)
+                span.set_data("failure_category", err_category)
                 return None

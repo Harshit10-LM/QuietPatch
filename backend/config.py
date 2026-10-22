@@ -87,6 +87,11 @@ class Config:
         GEMMA_API_PATCH_RECOVERY_MAX_TOKENS = int(os.getenv("GEMMA_API_PATCH_RECOVERY_MAX_TOKENS", "4096"))
     except ValueError:
         GEMMA_API_PATCH_RECOVERY_MAX_TOKENS = 4096
+    try:
+        # Thinking level for Gemma 4 patch generation ('minimal' prevents thinking tokens from exhausting output budget)
+        GEMMA_API_PATCH_THINKING_LEVEL = os.getenv("GEMMA_API_PATCH_THINKING_LEVEL", "minimal").strip()
+    except Exception:
+        GEMMA_API_PATCH_THINKING_LEVEL = "minimal"
 
     # Security Boundaries
     default_allowed_root = str(BASE_DIR.resolve())
@@ -134,6 +139,7 @@ class Config:
             "gemma_api_patch_timeout_seconds": cls.GEMMA_API_PATCH_TIMEOUT_SECONDS,
             "gemma_api_patch_max_output_tokens": cls.GEMMA_API_PATCH_MAX_OUTPUT_TOKENS,
             "gemma_api_patch_recovery_max_tokens": cls.GEMMA_API_PATCH_RECOVERY_MAX_TOKENS,
+            "gemma_api_patch_thinking_level": cls.GEMMA_API_PATCH_THINKING_LEVEL,
             "allowed_root": str(cls.QUIETPATCH_ALLOWED_ROOT),
             "sentry_configured": bool(cls.SENTRY_DSN),
             "sentry_environment": cls.SENTRY_ENVIRONMENT,
