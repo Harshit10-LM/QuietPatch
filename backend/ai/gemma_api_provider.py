@@ -846,43 +846,43 @@ class GemmaApiProvider(BaseAIProvider):
                                 rec_response = self._generate_with_retry(
                                     recovery_prompt, client, span=span, max_output_tokens=recovery_max_tokens, time_budget_seconds=remaining_batch_budget
                                 )
-                            rec_diag = extract_response_diagnostics(rec_response, max_expected_tokens=recovery_max_tokens)
+                                rec_diag = extract_response_diagnostics(rec_response, max_expected_tokens=recovery_max_tokens)
 
-                            if rec_diag.extracted_text:
-                                rec_cleaned = clean_json_text(rec_diag.extracted_text)
-                                if rec_cleaned:
-                                    try:
-                                        cand_data = json.loads(rec_cleaned)
-                                        if isinstance(cand_data, dict):
-                                            for val in cand_data.values():
-                                                if isinstance(val, list):
-                                                    cand_data = val
-                                                    break
-                                        if isinstance(cand_data, list):
-                                            parsed = cand_data
-                                            rec_diag.failure_category = "success"
-                                        else:
-                                            rec_diag.failure_category = "malformed_output"
-                                    except (json.JSONDecodeError, ValueError):
-                                        if rec_diag.finish_reason == "MAX_TOKENS":
-                                            rec_diag.failure_category = "output_truncated"
-                                        else:
-                                            rec_diag.failure_category = "malformed_output"
+                                if rec_diag.extracted_text:
+                                    rec_cleaned = clean_json_text(rec_diag.extracted_text)
+                                    if rec_cleaned:
+                                        try:
+                                            cand_data = json.loads(rec_cleaned)
+                                            if isinstance(cand_data, dict):
+                                                for val in cand_data.values():
+                                                    if isinstance(val, list):
+                                                        cand_data = val
+                                                        break
+                                            if isinstance(cand_data, list):
+                                                parsed = cand_data
+                                                rec_diag.failure_category = "success"
+                                            else:
+                                                rec_diag.failure_category = "malformed_output"
+                                        except (json.JSONDecodeError, ValueError):
+                                            if rec_diag.finish_reason == "MAX_TOKENS":
+                                                rec_diag.failure_category = "output_truncated"
+                                            else:
+                                                rec_diag.failure_category = "malformed_output"
+                                    else:
+                                        rec_diag.failure_category = "malformed_output"
+
+                                if parsed is None:
+                                    log_sanitized_diagnostics(
+                                        logging.WARNING, f"analysis_batch_{b_idx}_recovery", self.name, self.model, rec_diag, recovery_attempts=1
+                                    )
+                                    record_diagnostics_to_span(span, rec_diag, recovery_attempts=1)
+                                    span.set_data("recovery_attempted", True)
+                                    span.set_data("recovery_outcome", "failed")
                                 else:
-                                    rec_diag.failure_category = "malformed_output"
-
-                            if parsed is None:
-                                log_sanitized_diagnostics(
-                                    logging.WARNING, f"analysis_batch_{b_idx}_recovery", self.name, self.model, rec_diag, recovery_attempts=1
-                                )
-                                record_diagnostics_to_span(span, rec_diag, recovery_attempts=1)
-                                span.set_data("recovery_attempted", True)
-                                span.set_data("recovery_outcome", "failed")
-                            else:
-                                diag = rec_diag
-                                span.set_data("recovery_attempted", True)
-                                span.set_data("recovery_outcome", "recovered")
-                                logger.info("Hosted Gemma recovery succeeded on batch %d/%d.", b_idx, total_batches)
+                                    diag = rec_diag
+                                    span.set_data("recovery_attempted", True)
+                                    span.set_data("recovery_outcome", "recovered")
+                                    logger.info("Hosted Gemma recovery succeeded on batch %d/%d.", b_idx, total_batches)
 
                     if parsed is not None:
                         updates = {

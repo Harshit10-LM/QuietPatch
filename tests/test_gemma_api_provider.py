@@ -1733,3 +1733,36 @@ def test_http_504_retries_stop_and_successful_batches_survive():
     assert analyzed[2].ai_assisted is True
     assert analyzed[2].severity == Severity.LOW
 
+
+
+def test_analyze_and_prioritize_recovery_skip_does_not_raise_name_error():
+    """Regression test: when batch recovery is skipped due to insufficient budget,
+    rec_response must NOT be referenced (NameError). The function must return
+    gracefully instead of crashing with an unhandled exception."""
+    provider = GemmaApiProvider(api_key="test-key", model="gemma-test")
+
+    finding = Finding(
+        id="f-skip", category=FindingCategory.CONFIGURATION, title="Test Finding",
+        file_path="test.py", severity=Severity.MEDIUM, evidence="some evidence",
+        explanation="ex", suggested_action="action",
+    )
+
+    # Simulate a recoverable empty response (would normally trigger recovery)
+    empty_response = MagicMock()
+    empty_response.text = None
+    empty_response.candidates = []
+    empty_response.prompt_feedback = None
+    empty_response.usage_metadata = None
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.return_value = empty_response
+
+    with patch.object(provider, "_get_client", return_value=mock_client), \
+         patch.object(Config, "GEMMA_API_BATCH_SIZE", 1), \
+         patch.object(Config, "GEMMA_API_RETRY_BUDGET_SECONDS", 5.0):
+        # With a 5s budget and MIN_GOOGLE_DEADLINE=10s, budget is always insufficient
+        # for recovery. The code must NOT raise NameError — it should skip recovery cleanly.
+        result = provider.analyze_and_prioritize([finding])
+
+    # Finding should remain un-assisted (batch failed gracefully, no crash)
+    assert result[0].ai_assisted is False
