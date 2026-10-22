@@ -1873,3 +1873,275 @@ def test_transient_504_retry_success():
     assert response == mock_resp
     assert mock_client.models.generate_content.call_count == 2
 
+
+def test_default_patch_recovery_max_tokens_is_4096_and_greater_than_initial():
+    """Regression test: GEMMA_API_PATCH_RECOVERY_MAX_TOKENS must default to 4096,
+    strictly higher than GEMMA_API_PATCH_MAX_OUTPUT_TOKENS (2048).
+
+    Root cause: In production, initial request was capped at 2048 tokens and hit MAX_TOKENS.
+    Recovery was erroneously capped at 1536 tokens (< 2048), guaranteeing a second MAX_TOKENS
+    failure. Setting recovery to 4096 provides ample headroom to complete the full JSON payload.
+    """
+    from backend.config import Config
+    assert Config.GEMMA_API_PATCH_MAX_OUTPUT_TOKENS == 2048
+    assert Config.GEMMA_API_PATCH_RECOVERY_MAX_TOKENS == 4096
+    assert Config.GEMMA_API_PATCH_RECOVERY_MAX_TOKENS > Config.GEMMA_API_PATCH_MAX_OUTPUT_TOKENS
+
+
+def test_patch_request_max_tokens_diagnosed_correctly():
+    """Regression test 1: A patch request that reaches MAX_TOKENS is diagnosed correctly
+    as output_token_truncated and is classified as recoverable.
+    """
+    mock_resp = MagicMock()
+    cand = MagicMock()
+    cand.finish_reason = "MAX_TOKENS"
+    cand.content = MagicMock(parts=[MagicMock(text='{"change_summary": "Incomplete', thought=False)])
+    mock_resp.candidates = [cand]
+    mock_resp.text = '{"change_summary": "Incomplete'
+    class FakeUsage:
+        prompt_token_count = 458
+        candidates_token_count = 2045
+        total_token_count = 2503
+
+    mock_resp.usage_metadata = FakeUsage()
+
+    diag = extract_response_diagnostics(mock_resp, max_expected_tokens=2048)
+    assert diag.finish_reason == "MAX_TOKENS"
+    assert diag.failure_category == "output_token_truncated"
+    assert diag.canonical_category == "output_truncated"
+    assert diag.is_recoverable is True
+    assert diag.prompt_tokens == 458
+    assert diag.candidate_tokens == 2045
+
+
+def test_patch_recovery_uses_higher_output_budget_and_produces_valid_patch(tmp_path):
+    """Regression tests 2 & 3: Recovery uses reduced context, passes the higher configured
+    recovery max tokens (4096 vs 2048), and produces a valid reviewable ProposedPatch.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+
+    finding = Finding(
+        id="finding-doc-broken-25ec2a11",
+        category=FindingCategory.DOCUMENTATION,
+        title="Broken relative link: './docs/architecture.md' in README.md",
+        file_path="README.md",
+        evidence="[Architecture Details](./docs/architecture.md)",
+        explanation="Broken relative documentation link",
+        suggested_action="Fix link or create doc",
+    )
+    original_readme = (
+        "# NovaTask\n\n"
+        "- [Getting Started](./docs/getting_started.md)\n"
+        "- [Architecture Details](./docs/architecture.md)\n"
+    )
+
+    # Call 1: MAX_TOKENS truncation
+    res1 = MagicMock()
+    cand1 = MagicMock(finish_reason="MAX_TOKENS")
+    cand1.content = MagicMock(parts=[MagicMock(text='{"change_summary": "Incomplete json', thought=False)])
+    res1.candidates = [cand1]
+    res1.text = '{"change_summary": "Incomplete json'
+
+    # Call 2: Succeeded recovery response with complete JSON
+    valid_patch_json = json.dumps({
+        "change_summary": "Remove broken architecture link",
+        "proposed_content": (
+            "# NovaTask\n\n"
+            "- [Getting Started](./docs/getting_started.md)\n"
+        ),
+        "explanation": "Removes unlinked architecture document reference until written.",
+        "risks_assumptions": "Low risk documentation fix.",
+        "suggested_verification": "Verify markdown rendering in README.",
+    })
+    res2 = MagicMock()
+    cand2 = MagicMock(finish_reason="STOP")
+    cand2.content = MagicMock(parts=[MagicMock(text=valid_patch_json, thought=False)])
+    res2.candidates = [cand2]
+    res2.text = valid_patch_json
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = [res1, res2]
+    provider._client = mock_client
+
+    patch_result = provider.propose_patch(finding, original_readme, tmp_path, run_id="run-recovery-test")
+
+    # Assert 2 calls occurred (initial + recovery)
+    assert mock_client.models.generate_content.call_count == 2
+    calls = mock_client.models.generate_content.call_args_list
+
+    # Call 1: initial budget 2048
+    cfg1 = calls[0].kwargs.get("config")
+    assert cfg1 is not None
+    assert cfg1.max_output_tokens == 2048
+
+    # Call 2: recovery budget 4096 (strictly greater than initial!)
+    cfg2 = calls[1].kwargs.get("config")
+    assert cfg2 is not None
+    assert cfg2.max_output_tokens == 4096
+    assert cfg2.max_output_tokens > cfg1.max_output_tokens
+
+    # Verify recovery prompt contains brevity instructions and recovery note
+    recovery_prompt = calls[1].kwargs.get("contents")
+    assert "truncated due to token budget limits" in recovery_prompt
+    assert "CRITICAL INSTRUCTIONS:" in recovery_prompt
+
+    # Valid ProposedPatch created
+    assert patch_result is not None
+    assert patch_result.finding_id == "finding-doc-broken-25ec2a11"
+    assert patch_result.file_path == "README.md"
+    assert "- [Architecture Details]" not in patch_result.proposed_content
+    assert patch_result.diff is not None and len(patch_result.diff) > 0
+    assert patch_result.status == PatchStatus.PENDING
+    assert patch_result.is_demo is False
+    assert patch_result.ai_model == "gemma-4-26b-a4b-it"
+
+
+def test_two_consecutive_max_tokens_truncations_fail_cleanly_without_extra_retry(tmp_path):
+    """Regression test 4: When both initial and recovery requests hit MAX_TOKENS,
+    propose_patch must stop cleanly after exactly 1 recovery attempt (2 calls total),
+    return None without raising an unhandled exception, and record the failure.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+
+    finding = Finding(
+        id="finding-doc-broken-25ec2a11",
+        category=FindingCategory.DOCUMENTATION,
+        title="Broken link",
+        file_path="README.md",
+        evidence="[link](./broken.md)",
+        explanation="broken",
+        suggested_action="fix",
+    )
+
+    # Both call 1 and call 2 return MAX_TOKENS
+    res_trunc1 = MagicMock()
+    cand1 = MagicMock(finish_reason="MAX_TOKENS")
+    cand1.content = MagicMock(parts=[MagicMock(text='{"incomplete": 1', thought=False)])
+    res_trunc1.candidates = [cand1]
+    res_trunc1.text = '{"incomplete": 1'
+
+    res_trunc2 = MagicMock()
+    cand2 = MagicMock(finish_reason="MAX_TOKENS")
+    cand2.content = MagicMock(parts=[MagicMock(text='{"still_incomplete": 2', thought=False)])
+    res_trunc2.candidates = [cand2]
+    res_trunc2.text = '{"still_incomplete": 2'
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = [res_trunc1, res_trunc2]
+    provider._client = mock_client
+
+    patch_result = provider.propose_patch(finding, "content", tmp_path, run_id="run-double-trunc")
+
+    # Clean failure: returns None, no crash, exactly 2 calls made (no 3rd call!)
+    assert patch_result is None
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_three_finding_maintenance_run_preserves_two_patches_when_third_patch_encounters_max_tokens(tmp_path):
+    """Regression test 6 & 8: In a 3-finding run, when Finding 1 and 2 succeed but Finding 3
+    fails with two consecutive MAX_TOKENS truncations, both earlier patches are preserved,
+    proposal stage is marked PARTIAL with exact counts ('2/3 patches (1 failed)'),
+    and the overall run status completes cleanly.
+    """
+    f1 = Finding(id="f-license", category=FindingCategory.GENERAL, title="Missing LICENSE", file_path="LICENSE", evidence="", explanation="No license", suggested_action="Add MIT", ai_assisted=True)
+    f2 = Finding(id="f-gitignore", category=FindingCategory.GENERAL, title="Missing .gitignore", file_path=".gitignore", evidence="", explanation="No gitignore", suggested_action="Add gitignore", ai_assisted=True)
+    f3 = Finding(id="f-doc-broken", category=FindingCategory.DOCUMENTATION, title="Broken link in README", file_path="README.md", evidence="[broken](./doc.md)", explanation="Broken link", suggested_action="Fix link", ai_assisted=True)
+
+    (tmp_path / "LICENSE").write_text("", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# Title\n[broken](./doc.md)\n", encoding="utf-8")
+
+    mock_client = MagicMock()
+
+    # Patch 1 (LICENSE): succeeds on call 1
+    resp1 = MagicMock()
+    resp1.text = json.dumps({"change_summary": "Add MIT license", "proposed_content": "MIT License\n", "explanation": "Adds license", "risks_assumptions": "None", "suggested_verification": "Check"})
+
+    # Patch 2 (.gitignore): succeeds on call 1
+    resp2 = MagicMock()
+    resp2.text = json.dumps({"change_summary": "Add .gitignore", "proposed_content": ".env\n__pycache__/\n", "explanation": "Adds gitignore", "risks_assumptions": "None", "suggested_verification": "Check"})
+
+    # Patch 3 (README.md): fails initial (MAX_TOKENS) and fails recovery (MAX_TOKENS)
+    trunc_resp1 = MagicMock()
+    c1 = MagicMock(finish_reason="MAX_TOKENS")
+    c1.content = MagicMock(parts=[MagicMock(text='{"incomplete": 1', thought=False)])
+    trunc_resp1.candidates = [c1]
+    trunc_resp1.text = '{"incomplete": 1'
+
+    trunc_resp2 = MagicMock()
+    c2 = MagicMock(finish_reason="MAX_TOKENS")
+    c2.content = MagicMock(parts=[MagicMock(text='{"incomplete": 2', thought=False)])
+    trunc_resp2.candidates = [c2]
+    trunc_resp2.text = '{"incomplete": 2'
+
+    # Side effect: patch1 (1 call), patch2 (1 call), patch3 (2 calls: initial + recovery)
+    mock_client.models.generate_content.side_effect = [
+        resp1,
+        resp2,
+        trunc_resp1,
+        trunc_resp2,
+    ]
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    agent = AgentService(provider_name="gemma_api")
+    agent.provider = provider
+
+    with patch.object(agent.scan_engine, "discover_files", return_value=([tmp_path / "README.md"], 50)), \
+         patch.object(agent.scan_engine, "run_scanners", return_value=([f1, f2, f3], {})), \
+         patch.object(provider, "analyze_and_prioritize", return_value=[f1, f2, f3]):
+
+        run = agent.execute_maintenance_run(
+            repo_path=tmp_path,
+            repo_name="MultiPatchRepo",
+            repo_type="local",
+            run_id="run-multi-patch",
+        )
+
+    # 1. Successful patches 1 and 2 survive and are preserved!
+    assert len(run.patches) == 2
+    assert {p.finding_id for p in run.patches} == {"f-license", "f-gitignore"}
+
+    # 2. Proposal stage status is PARTIAL
+    assert run.stages["proposal"].status == "partial"
+    assert "2/3 patches" in run.stages["proposal"].details
+    assert "1 patch generation attempts failed" in run.stages["proposal"].details
+
+    # 3. Overall run completed cleanly
+    assert run.status == "completed"
+    assert mock_client.models.generate_content.call_count == 4
+
+
+def test_patch_proposal_rejects_invalid_schema_empty_diff_and_identical_content(tmp_path):
+    """Regression test 7: propose_patch rejects invalid JSON, identical content,
+    and empty diff without raising unhandled exceptions.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(id="f-val", category=FindingCategory.CONFIGURATION, title="Check", file_path="app.py", evidence="x", explanation="e", suggested_action="a")
+
+    # 1. Invalid JSON that cannot be recovered
+    bad_resp = MagicMock()
+    bad_cand = MagicMock(finish_reason="STOP")
+    bad_cand.content = MagicMock(parts=[MagicMock(text="not json at all", thought=False)])
+    bad_resp.candidates = [bad_cand]
+    bad_resp.text = "not json at all"
+    mock_client.models.generate_content.return_value = bad_resp
+
+    p1 = provider.propose_patch(finding, "original\n", tmp_path)
+    assert p1 is None
+
+    # 2. Identical proposed_content (no change)
+    same_resp = MagicMock()
+    same_cand = MagicMock(finish_reason="STOP")
+    same_cand.content = MagicMock(parts=[MagicMock(text="same", thought=False)])
+    same_resp.candidates = [same_cand]
+    same_resp.text = json.dumps({"change_summary": "No op", "proposed_content": "original\n"})
+    mock_client.models.generate_content.return_value = same_resp
+
+    p2 = provider.propose_patch(finding, "original\n", tmp_path)
+    assert p2 is None
+

@@ -957,8 +957,8 @@ class GemmaApiProvider(BaseAIProvider):
         if not client:
             return None
 
-        bounded_content = self._bound_file_content(file_content, finding, max_chars=2000)
-        bounded_evidence = (finding.evidence or "")[:250]
+        bounded_content = self._bound_file_content(file_content, finding, max_chars=1600)
+        bounded_evidence = (finding.evidence or "")[:200]
 
         prompt = (
             f"{SYSTEM_INSTRUCTION}\n"
@@ -968,14 +968,17 @@ class GemmaApiProvider(BaseAIProvider):
             f"- Evidence: {bounded_evidence}\n"
             f"- Suggestion: {(finding.suggested_action or '')[:200]}\n\n"
             f"Original file content:\n```\n{bounded_content}\n```\n\n"
-            f"Propose the updated complete file content that addresses this finding with minimal disruption.\n"
-            f"Return JSON:\n"
+            f"Task: Propose the updated complete file content that addresses this finding with minimal disruption.\n"
+            f"CRITICAL INSTRUCTIONS:\n"
+            f"1. Make ONLY the minimal change required to fix the finding.\n"
+            f"2. Keep 'change_summary', 'explanation', 'risks_assumptions', and 'suggested_verification' strictly to 1 concise sentence each. Do not write essay analysis.\n"
+            f"3. Return ONLY a single raw JSON object matching the schema below without markdown code fences or conversational text.\n\n"
             f"{{\n"
-            f'  "change_summary": "1 sentence describing change",\n'
+            f'  "change_summary": "1 concise sentence describing change",\n'
             f'  "proposed_content": "complete new file text",\n'
-            f'  "explanation": "why this fix resolves the issue",\n'
-            f'  "risks_assumptions": "any assumptions or risks",\n'
-            f'  "suggested_verification": "how to verify the fix"\n'
+            f'  "explanation": "1 concise sentence why this fix resolves the issue",\n'
+            f'  "risks_assumptions": "1 concise sentence on any assumptions or risks",\n'
+            f'  "suggested_verification": "1 concise sentence on how to verify the fix"\n'
             f"}}"
         )
 
@@ -1049,28 +1052,31 @@ class GemmaApiProvider(BaseAIProvider):
                     recovery_attempts = 1
                     recovery_max_tokens = Config.GEMMA_API_PATCH_RECOVERY_MAX_TOKENS
                     if diag.failure_category in {"output_truncated", "output_token_truncated"}:
-                        reduced_content = self._bound_file_content(file_content, finding, max_chars=800)
+                        reduced_content = self._bound_file_content(file_content, finding, max_chars=1200)
                         recovery_prompt = (
                             f"{SYSTEM_INSTRUCTION}\n"
                             f"The previous patch generation was truncated due to token budget limits.\n"
-                            f"Propose a concise, minimal fix strictly for this finding without unnecessary whitespace or changes:\n"
-                            f"Finding: {finding.title[:150]}\n"
-                            f"File: {finding.file_path}\n"
-                            f"Evidence: {bounded_evidence[:150]}\n\n"
-                            f"Relevant file snippet:\n```\n{reduced_content}\n```\n\n"
-                            f"Return ONLY valid JSON matching this schema:\n"
+                            f"Propose the smallest valid change needed to address this finding with minimal disruption:\n"
+                            f"- Finding: {finding.title[:150]}\n"
+                            f"- File: {finding.file_path}\n"
+                            f"- Evidence: {bounded_evidence[:150]}\n\n"
+                            f"Relevant file content:\n```\n{reduced_content}\n```\n\n"
+                            f"CRITICAL INSTRUCTIONS:\n"
+                            f"1. Make ONLY the minimal change required to fix the finding.\n"
+                            f"2. Keep 'change_summary', 'explanation', 'risks_assumptions', and 'suggested_verification' strictly to 1 concise sentence each.\n"
+                            f"3. Return ONLY a single valid JSON object matching the schema without markdown code blocks or conversational text:\n"
                             f"{{\n"
                             f'  "change_summary": "1 concise sentence describing fix",\n'
                             f'  "proposed_content": "updated complete file text with fix applied",\n'
-                            f'  "explanation": "concise explanation",\n'
-                            f'  "risks_assumptions": "minimal risks",\n'
-                            f'  "suggested_verification": "how to verify"\n'
+                            f'  "explanation": "1 concise sentence explaining why this fix resolves the issue",\n'
+                            f'  "risks_assumptions": "1 concise sentence on any minimal risks or assumptions",\n'
+                            f'  "suggested_verification": "1 concise sentence on how to verify the fix"\n'
                             f"}}"
                         )
                     else:
                         recovery_prompt = (
                             f"{prompt}\n\n"
-                            "CRITICAL: Output ONLY a valid JSON object adhering to the schema without markdown code blocks."
+                            "CRITICAL: Output ONLY a single valid JSON object adhering strictly to the schema without markdown code blocks or preamble."
                         )
                     logger.info(
                         "Hosted Gemma patch recoverable response (%s). Attempting bounded recovery (1/1) with %.2fs remaining budget...",

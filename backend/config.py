@@ -75,13 +75,18 @@ class Config:
     except ValueError:
         GEMMA_API_PATCH_TIMEOUT_SECONDS = 90.0
     try:
+        # Initial token limit for patch proposal. Keeps baseline generations fast and bounded.
         GEMMA_API_PATCH_MAX_OUTPUT_TOKENS = int(os.getenv("GEMMA_API_PATCH_MAX_OUTPUT_TOKENS", "2048"))
     except ValueError:
         GEMMA_API_PATCH_MAX_OUTPUT_TOKENS = 2048
     try:
-        GEMMA_API_PATCH_RECOVERY_MAX_TOKENS = int(os.getenv("GEMMA_API_PATCH_RECOVERY_MAX_TOKENS", "1536"))
+        # Recovery token budget: MUST be sufficiently larger than the initial budget (default 4096).
+        # In production, initial requests truncated at 2048 tokens failed when recovery was capped
+        # at only 1536 tokens. Setting recovery to 4096 gives the model adequate headroom to complete
+        # the entire JSON schema and proposed file content.
+        GEMMA_API_PATCH_RECOVERY_MAX_TOKENS = int(os.getenv("GEMMA_API_PATCH_RECOVERY_MAX_TOKENS", "4096"))
     except ValueError:
-        GEMMA_API_PATCH_RECOVERY_MAX_TOKENS = 1536
+        GEMMA_API_PATCH_RECOVERY_MAX_TOKENS = 4096
 
     # Security Boundaries
     default_allowed_root = str(BASE_DIR.resolve())
