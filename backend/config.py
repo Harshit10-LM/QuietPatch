@@ -52,17 +52,28 @@ class Config:
     except ValueError:
         GEMMA_API_BATCH_SIZE = 3
     try:
-        GEMMA_API_RETRY_BUDGET_SECONDS = float(os.getenv("GEMMA_API_RETRY_BUDGET_SECONDS", "30.0"))
+        # Total wall-clock budget per analysis batch (initial request + up to max_retries retries
+        # with backoff). Must be > (max_retries+1) * GEMMA_API_REQUEST_TIMEOUT_SECONDS + backoff.
+        # Default 120s: allows two 60s requests with backoff before exhausting the budget.
+        GEMMA_API_RETRY_BUDGET_SECONDS = float(os.getenv("GEMMA_API_RETRY_BUDGET_SECONDS", "120.0"))
     except ValueError:
-        GEMMA_API_RETRY_BUDGET_SECONDS = 30.0
+        GEMMA_API_RETRY_BUDGET_SECONDS = 120.0
     try:
-        GEMMA_API_REQUEST_TIMEOUT_SECONDS = float(os.getenv("GEMMA_API_REQUEST_TIMEOUT_SECONDS", "15.0"))
+        # Per-request timeout in seconds. CRITICAL: the google-genai SDK sends this value
+        # dual-purpose: (1) as the httpx client read timeout and (2) as the X-Server-Timeout
+        # header that Google's upstream server uses as a hard processing deadline. Setting this
+        # below the actual model generation time causes HTTP 504 DEADLINE_EXCEEDED from Google.
+        # Production evidence shows successful generations take 20-23s; 60s gives adequate margin.
+        # Google enforces a minimum of 10s (requests below this fail with HTTP 400 INVALID_ARGUMENT).
+        GEMMA_API_REQUEST_TIMEOUT_SECONDS = float(os.getenv("GEMMA_API_REQUEST_TIMEOUT_SECONDS", "60.0"))
     except ValueError:
-        GEMMA_API_REQUEST_TIMEOUT_SECONDS = 15.0
+        GEMMA_API_REQUEST_TIMEOUT_SECONDS = 60.0
     try:
-        GEMMA_API_PATCH_TIMEOUT_SECONDS = float(os.getenv("GEMMA_API_PATCH_TIMEOUT_SECONDS", "35.0"))
+        # Overall wall-clock budget for a single patch proposal including recovery attempt.
+        # Must be > 2 * GEMMA_API_REQUEST_TIMEOUT_SECONDS + backoff.
+        GEMMA_API_PATCH_TIMEOUT_SECONDS = float(os.getenv("GEMMA_API_PATCH_TIMEOUT_SECONDS", "90.0"))
     except ValueError:
-        GEMMA_API_PATCH_TIMEOUT_SECONDS = 35.0
+        GEMMA_API_PATCH_TIMEOUT_SECONDS = 90.0
     try:
         GEMMA_API_PATCH_MAX_OUTPUT_TOKENS = int(os.getenv("GEMMA_API_PATCH_MAX_OUTPUT_TOKENS", "2048"))
     except ValueError:

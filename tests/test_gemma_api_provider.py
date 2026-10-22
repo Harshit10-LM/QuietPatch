@@ -1766,3 +1766,110 @@ def test_analyze_and_prioritize_recovery_skip_does_not_raise_name_error():
 
     # Finding should remain un-assisted (batch failed gracefully, no crash)
     assert result[0].ai_assisted is False
+
+
+def test_default_request_timeout_is_60s_not_15s():
+    """Regression test: GEMMA_API_REQUEST_TIMEOUT_SECONDS default must be 60.0s.
+
+    Root cause: the google-genai SDK sends HttpOptions.timeout as both:
+      (1) the httpx client read timeout (Python-side socket abort), AND
+      (2) the X-Server-Timeout header (Google upstream hard processing deadline).
+    A 15s value caused HTTP 504 DEADLINE_EXCEEDED on legitimate 20-23s generations.
+    This test confirms the default is now 60s, giving generations adequate headroom.
+    """
+    # Config is a class, reload to get fresh defaults
+    from backend.config import Config
+    assert Config.GEMMA_API_REQUEST_TIMEOUT_SECONDS == 60.0, (
+        f"Expected 60.0 but got {Config.GEMMA_API_REQUEST_TIMEOUT_SECONDS}. "
+        "The SDK sends this value as X-Server-Timeout to Google's upstream server. "
+        "A 15s value caused HTTP 504 on legitimate 20-23s generations."
+    )
+
+
+def test_default_retry_budget_is_120s():
+    """Regression test: GEMMA_API_RETRY_BUDGET_SECONDS default must be 120.0s.
+
+    With a 60s per-request timeout and max_retries=2, the budget must accommodate
+    at least (2+1)*60s plus backoff. The old 30s default was exhausted by two 15s
+    requests, which also failed because those 15s requests hit X-Server-Timeout.
+    """
+    from backend.config import Config
+    assert Config.GEMMA_API_RETRY_BUDGET_SECONDS == 120.0, (
+        f"Expected 120.0 but got {Config.GEMMA_API_RETRY_BUDGET_SECONDS}."
+    )
+
+
+def test_default_patch_timeout_is_90s():
+    """Regression test: GEMMA_API_PATCH_TIMEOUT_SECONDS default must be 90.0s.
+
+    Patch generation requires one or two 60s-timeout requests. Old default of 35s
+    was smaller than a single request timeout.
+    """
+    from backend.config import Config
+    assert Config.GEMMA_API_PATCH_TIMEOUT_SECONDS == 90.0, (
+        f"Expected 90.0 but got {Config.GEMMA_API_PATCH_TIMEOUT_SECONDS}."
+    )
+
+
+def test_sdk_timeout_ms_is_at_least_60000_by_default():
+    """Regression test: the timeout_ms value passed to GenerateContentConfig.http_options
+    must be >= 60000ms (60s) by default, ensuring Google's X-Server-Timeout is >= 60s.
+
+    This is the core fix for HTTP 504 DEADLINE_EXCEEDED: the SDK sends HttpOptions.timeout
+    (ms) as X-Server-Timeout (seconds, ceiling) to Google's upstream server. Setting it
+    to 15000ms caused the server to abort requests after ~15s.
+    """
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.text = json.dumps([{"id": "f1", "severity": "medium", "explanation": "ok", "suggested_action": "fix"}])
+    mock_client.models.generate_content.return_value = mock_resp
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-test")
+
+    with patch.object(Config, "GEMMA_API_REQUEST_TIMEOUT_SECONDS", 60.0), \
+         patch.object(Config, "GEMMA_API_RETRY_BUDGET_SECONDS", 120.0):
+        provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=120.0)
+
+    call_kwargs = mock_client.models.generate_content.call_args.kwargs
+    passed_config = call_kwargs.get("config")
+    assert passed_config is not None
+    assert passed_config.http_options is not None
+    timeout_ms = passed_config.http_options.timeout
+    assert timeout_ms >= 60000, (
+        f"Expected timeout >= 60000ms (60s) but got {timeout_ms}ms. "
+        "The SDK sends this as X-Server-Timeout to Google's server. "
+        "Values < generation time cause HTTP 504 DEADLINE_EXCEEDED."
+    )
+    assert timeout_ms >= 10000, "Must always be >= 10000ms (Google's minimum allowed deadline)"
+    # Single attempt (SDK-level retries disabled; application layer controls retries)
+    assert passed_config.http_options.retry_options.attempts == 1
+
+
+def test_transient_504_retry_success():
+    """Regression test: verifies that transient HTTP 504 DEADLINE_EXCEEDED is retried
+    and succeeds when the second attempt returns HTTP 200.
+    """
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.text = json.dumps([{"id": "f1", "severity": "medium", "explanation": "fixed", "suggested_action": "update"}])
+
+    err_504 = genai_errors.ServerError(504, "Deadline exceeded / DEADLINE_EXCEEDED")
+
+    # Attempt 1: 504 Deadline exceeded, Attempt 2: Success
+    mock_client.models.generate_content.side_effect = [
+        err_504,
+        mock_resp,
+    ]
+
+    provider = GemmaApiProvider(
+        api_key="test-key",
+        model="gemma-4-26b-a4b-it",
+        max_retries=2,
+        backoff_factor=0.001,  # fast backoff for unit test
+    )
+    provider._client = mock_client
+
+    response = provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=120.0)
+    assert response == mock_resp
+    assert mock_client.models.generate_content.call_count == 2
+

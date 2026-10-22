@@ -44,9 +44,14 @@ class GemmaApiResponseError(GemmaApiError):
     pass
 
 
-# Google Gen AI API strictly enforces a minimum allowed request deadline of 10.0 seconds.
-# Requests with deadline/timeout below 10 seconds are rejected with:
-# "The minimum allowed deadline is 10 seconds".
+# Google Gen AI SDK (v2+) sends HttpOptions.timeout dual-purpose:
+#   (1) httpx client read timeout (Python-side socket abort)
+#   (2) X-Server-Timeout header (Google upstream hard processing deadline, in seconds)
+# If timeout = 15000ms (15s), Google aborts the request after ~15s with HTTP 504
+# DEADLINE_EXCEEDED — even for legitimate 20-23s generations.
+# Google also enforces a hard MINIMUM of 10.0s; below this returns HTTP 400
+# INVALID_ARGUMENT: "Manually set deadline is too short. Minimum allowed deadline is 10s".
+# See: populate_server_timeout_header() in google.genai._api_client
 MIN_GOOGLE_DEADLINE_SECONDS = 10.0
 
 
