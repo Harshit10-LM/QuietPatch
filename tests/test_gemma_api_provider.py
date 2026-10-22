@@ -1392,7 +1392,7 @@ def test_multibatch_partial_success_preserves_successful_findings_and_patches(tm
 
 
 def test_sdk_request_timeout_bounded_to_remaining_budget():
-    """3. An SDK request cannot silently exceed the remaining configured budget."""
+    """3. An SDK request cannot silently exceed the remaining configured budget, and never sends a deadline below Google's 10s minimum."""
     mock_client = MagicMock()
     mock_resp = MagicMock()
     mock_resp.text = '{"status": "ok"}'
@@ -1401,15 +1401,17 @@ def test_sdk_request_timeout_bounded_to_remaining_budget():
     provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
 
     with patch.object(Config, "GEMMA_API_REQUEST_TIMEOUT_SECONDS", 15.0):
-        # When budget is 10s, allowed request timeout must be bounded to <= 9500ms (10s - 0.5s safety margin)
-        provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=10.0)
+        # When budget is 12s, allowed request timeout must be bounded to min(15s, 12s - 0.5s safety margin) = 11500ms, and >= 10000ms
+        provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=12.0)
 
         call_kwargs = mock_client.models.generate_content.call_args.kwargs
         passed_config = call_kwargs.get("config")
         assert passed_config is not None
         assert passed_config.http_options is not None
-        # Must be bounded by remaining budget minus safety margin: min(15000, 10000 - 500) = 9500ms
-        assert passed_config.http_options.timeout <= 9500
+        # Must be bounded by remaining budget minus safety margin: min(15000, 12000 - 500) = 11500ms
+        assert passed_config.http_options.timeout <= 11500
+        # Must NEVER be below Google's 10s minimum allowed deadline
+        assert passed_config.http_options.timeout >= 10000
         assert passed_config.http_options.retry_options.attempts == 1
 
 
@@ -1467,11 +1469,11 @@ def test_retry_after_delay_cannot_exceed_remaining_budget():
     provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=2)
     provider._client = mock_client
 
-    with patch.object(Config, "GEMMA_API_RETRY_BUDGET_SECONDS", 10.0):
+    with patch.object(Config, "GEMMA_API_RETRY_BUDGET_SECONDS", 15.0):
         with pytest.raises(GemmaApiTransientError) as exc_info:
-            provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=10.0)
+            provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=15.0)
 
-        # Since 25s delay exceeds 10s budget, retries must abort immediately on attempt 1
+        # Since 25s delay exceeds 15s budget, retries must abort immediately on attempt 1
         assert "time budget exhausted" in str(exc_info.value).lower()
         assert mock_client.models.generate_content.call_count == 1
 
@@ -1595,4 +1597,139 @@ def test_failed_patch_does_not_erase_successful_patches_and_records_partial(tmp_
 
     # Overall run is completed with partial stage
     assert run.status == "completed"
+
+
+def test_budget_below_google_minimum_causes_no_outgoing_requests():
+    """Remaining budget < 10.5s aborts immediately with 0 outgoing requests to Google Gen AI."""
+    mock_client = MagicMock()
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+
+    # 1. Exact 2-second deadline rejected by Google in production
+    with pytest.raises(GemmaApiTransientError) as exc_info:
+        provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=2.0)
+
+    assert "time budget exhausted" in str(exc_info.value).lower()
+    assert mock_client.models.generate_content.call_count == 0
+
+    # 2. 10.0 seconds budget (leaves 9.5s < 10.0s deadline required)
+    with pytest.raises(GemmaApiTransientError) as exc_info:
+        provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=10.0)
+
+    assert "time budget exhausted" in str(exc_info.value).lower()
+    assert mock_client.models.generate_content.call_count == 0
+
+
+def test_request_deadline_is_never_below_ten_seconds():
+    """When an outgoing request is issued, the deadline/timeout is strictly >= 10.0s (10000ms)."""
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.text = '{"status": "ok"}'
+    mock_client.models.generate_content.return_value = mock_resp
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+
+    # Even if Config.GEMMA_API_REQUEST_TIMEOUT_SECONDS was erroneously configured as 2.0s or 5.0s
+    with patch.object(Config, "GEMMA_API_REQUEST_TIMEOUT_SECONDS", 2.0):
+        provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=20.0)
+
+        call_kwargs = mock_client.models.generate_content.call_args.kwargs
+        passed_config = call_kwargs.get("config")
+        assert passed_config is not None
+        assert passed_config.http_options.timeout >= 10000
+
+
+def test_batch_analysis_recovery_skips_when_remaining_budget_cannot_accommodate_google_minimum():
+    """Batch analysis skips recovery without a doomed Google request when remaining batch budget is < 10.5s."""
+    mock_client = MagicMock()
+    mock_trunc = MagicMock()
+    mock_trunc.text = "Incomplete JSON {"
+    mock_trunc.candidates = [MagicMock(finish_reason="MAX_TOKENS")]
+
+    current_time = 1000.0
+
+    def fake_time():
+        nonlocal current_time
+        return current_time
+
+    # Simulate initial call taking 22 seconds of a 30s batch budget, leaving 8.0s (< 10.5s)
+    def slow_generate(**kwargs):
+        nonlocal current_time
+        current_time += 22.0
+        return mock_trunc
+
+    mock_client.models.generate_content.side_effect = slow_generate
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    findings = [
+        Finding(
+            id=f"f{i}",
+            category=FindingCategory.CONFIGURATION,
+            title=f"Finding {i}",
+            file_path="config.py",
+            severity=Severity.HIGH,
+            evidence="config error",
+            explanation="needs fix",
+            suggested_action="update config",
+        )
+        for i in range(2)
+    ]
+
+    with patch("time.time", side_effect=fake_time), \
+         patch.object(Config, "GEMMA_API_RETRY_BUDGET_SECONDS", 30.0), \
+         patch.object(Config, "GEMMA_API_BATCH_SIZE", 5):
+
+        result = provider.analyze_and_prioritize(findings)
+
+        # Only 1 generate_content call was made; recovery was skipped due to remaining budget (8s < 10.5s)
+        assert mock_client.models.generate_content.call_count == 1
+        # Findings returned without crash, unassisted
+        assert len(result) == 2
+        assert not any(f.ai_assisted for f in result)
+
+
+def test_http_504_retries_stop_and_successful_batches_survive():
+    """HTTP 504 on one batch does not erase successful findings from other batches, and allows patches."""
+    mock_client = MagicMock()
+
+    # Batch 1 response (success)
+    b1_resp = MagicMock()
+    b1_resp.text = json.dumps([
+        {"id": "f1", "severity": "critical", "explanation": "Urgent bug", "suggested_action": "Fix bug"}
+    ])
+
+    # Batch 2 error: 504 Gateway Timeout / DEADLINE_EXCEEDED
+    err_504 = genai_errors.ServerError(504, "Gateway Timeout / DEADLINE_EXCEEDED")
+
+    # Batch 3 response (success)
+    b3_resp = MagicMock()
+    b3_resp.text = json.dumps([
+        {"id": "f3", "severity": "low", "explanation": "Minor style", "suggested_action": "Clean up"}
+    ])
+
+    mock_client.models.generate_content.side_effect = [
+        b1_resp,
+        err_504, err_504,  # batch 2 fails across attempts
+        b3_resp,
+    ]
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=1, backoff_factor=0.01)
+    provider._client = mock_client
+
+    findings = [
+        Finding(id="f1", category=FindingCategory.CONFIGURATION, title="F1", file_path="f1.py", severity=Severity.MEDIUM, evidence="e1", explanation="ex1", suggested_action="a1"),
+        Finding(id="f2", category=FindingCategory.CONFIGURATION, title="F2", file_path="f2.py", severity=Severity.MEDIUM, evidence="e2", explanation="ex2", suggested_action="a2"),
+        Finding(id="f3", category=FindingCategory.CONFIGURATION, title="F3", file_path="f3.py", severity=Severity.MEDIUM, evidence="e3", explanation="ex3", suggested_action="a3"),
+    ]
+
+    with patch.object(Config, "GEMMA_API_BATCH_SIZE", 1):
+        analyzed = provider.analyze_and_prioritize(findings)
+
+    # Findings from batch 1 and batch 3 were successfully evaluated despite batch 2 failure
+    assert analyzed[0].ai_assisted is True
+    assert analyzed[0].severity == Severity.CRITICAL
+    assert analyzed[1].ai_assisted is False  # Batch 2 failed
+    assert analyzed[2].ai_assisted is True
+    assert analyzed[2].severity == Severity.LOW
 

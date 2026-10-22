@@ -44,6 +44,12 @@ class GemmaApiResponseError(GemmaApiError):
     pass
 
 
+# Google Gen AI API strictly enforces a minimum allowed request deadline of 10.0 seconds.
+# Requests with deadline/timeout below 10 seconds are rejected with:
+# "The minimum allowed deadline is 10 seconds".
+MIN_GOOGLE_DEADLINE_SECONDS = 10.0
+
+
 def sanitize_error_message(msg: str) -> str:
     """Sanitizes raw error message by scrubbing API keys, local paths, and private details."""
     if not msg:
@@ -484,7 +490,8 @@ class GemmaApiProvider(BaseAIProvider):
                 from google import genai
                 # Configure single attempt (disable SDK internal retries) so our application
                 # bounded retry policy controls all retries with timing, backoff, and observability.
-                req_timeout_ms = max(1000, int(Config.GEMMA_API_REQUEST_TIMEOUT_SECONDS * 1000))
+                # Never configure a timeout below Google's 10.0s minimum allowed deadline.
+                req_timeout_ms = max(int(MIN_GOOGLE_DEADLINE_SECONDS * 1000), int(Config.GEMMA_API_REQUEST_TIMEOUT_SECONDS * 1000))
                 http_options = genai.types.HttpOptions(
                     retry_options=genai.types.HttpRetryOptions(attempts=1),
                     timeout=req_timeout_ms,
@@ -547,16 +554,18 @@ class GemmaApiProvider(BaseAIProvider):
         last_code = None
         total_attempts = self.max_retries + 1
         safety_margin = 0.5  # seconds reserved for exception handling, logging, and Sentry
+        min_required_budget = MIN_GOOGLE_DEADLINE_SECONDS + safety_margin  # 10.5s minimum budget needed for a compliant Google request
 
         for attempt in range(1, total_attempts + 1):
             elapsed = time.time() - start_time
             remaining_budget = budget - elapsed
 
-            # Budget check BEFORE starting attempt
-            if remaining_budget <= safety_margin:
+            # Budget check BEFORE starting attempt: Google strictly requires a minimum 10.0s deadline.
+            # If remaining_budget < min_required_budget (10.5s), we cannot issue a compliant request.
+            if remaining_budget < min_required_budget:
                 logger.warning(
-                    "Hosted Gemma retry budget exhausted (remaining %.2fs <= safety margin %.2fs) before attempt %d/%d (total elapsed %.2fs)",
-                    remaining_budget, safety_margin, attempt, total_attempts, elapsed
+                    "Hosted Gemma retry budget insufficient (remaining %.2fs < min required %.2fs) before attempt %d/%d (total elapsed %.2fs)",
+                    remaining_budget, min_required_budget, attempt, total_attempts, elapsed
                 )
                 if span:
                     span.set_tag("error_category", "transient_api_error")
@@ -567,10 +576,11 @@ class GemmaApiProvider(BaseAIProvider):
                     code=last_code or 500,
                 )
 
-            # Enforce real, bounded request timeout in milliseconds based on remaining budget
-            configured_req_timeout = float(Config.GEMMA_API_REQUEST_TIMEOUT_SECONDS)
-            allowed_req_timeout = max(0.5, min(configured_req_timeout, remaining_budget - safety_margin))
-            req_timeout_ms = max(500, int(allowed_req_timeout * 1000))
+            # Enforce real, bounded request timeout in milliseconds based on remaining budget.
+            # Never issue a request with a deadline below Google's 10.0s minimum.
+            configured_req_timeout = max(MIN_GOOGLE_DEADLINE_SECONDS, float(Config.GEMMA_API_REQUEST_TIMEOUT_SECONDS))
+            allowed_req_timeout = max(MIN_GOOGLE_DEADLINE_SECONDS, min(configured_req_timeout, remaining_budget - safety_margin))
+            req_timeout_ms = int(allowed_req_timeout * 1000)
 
             config = None
             try:
@@ -643,10 +653,10 @@ class GemmaApiProvider(BaseAIProvider):
                     delay = min(8.0, (self.backoff_factor * (2 ** (attempt - 1))) + random.uniform(0.1, 0.4))
 
                 remaining_after_delay = budget - (time.time() - start_time + delay)
-                if remaining_after_delay <= safety_margin:
+                if remaining_after_delay < min_required_budget:
                     logger.warning(
-                        "Hosted Gemma retry delay (%.2fs) would exceed remaining time budget (total %.2fs, remaining after delay %.2fs). Aborting retries.",
-                        delay, budget, remaining_after_delay
+                        "Hosted Gemma retry delay (%.2fs) would leave insufficient time budget (total %.2fs, remaining after delay %.2fs < min required %.2fs). Aborting retries without sleeping.",
+                        delay, budget, remaining_after_delay, min_required_budget
                     )
                     if span:
                         span.set_tag("error_category", "transient_api_error")
@@ -714,6 +724,9 @@ class GemmaApiProvider(BaseAIProvider):
         total_batches = (len(findings) + batch_size - 1) // batch_size
         successful_batches = 0
         failed_batches = 0
+        batch_budget = float(Config.GEMMA_API_RETRY_BUDGET_SECONDS)
+        safety_margin = 0.5
+        min_required_budget = MIN_GOOGLE_DEADLINE_SECONDS + safety_margin
 
         with agent_stage_span(
             "Hosted Gemma Prioritization",
@@ -724,6 +737,7 @@ class GemmaApiProvider(BaseAIProvider):
             extra_tags={"total_batches": total_batches, "findings_count": len(findings)},
         ) as span:
             for b_idx, i in enumerate(range(0, len(findings), batch_size), start=1):
+                t_batch_start = time.time()
                 chunk = findings[i:i + batch_size]
                 findings_payload = [
                     {
@@ -756,7 +770,7 @@ class GemmaApiProvider(BaseAIProvider):
 
                 try:
                     response = self._generate_with_retry(
-                        prompt, client, span=span, max_output_tokens=initial_max_tokens
+                        prompt, client, span=span, max_output_tokens=initial_max_tokens, time_budget_seconds=batch_budget
                     )
                     diag = extract_response_diagnostics(response, max_expected_tokens=initial_max_tokens)
 
@@ -790,38 +804,48 @@ class GemmaApiProvider(BaseAIProvider):
                         record_diagnostics_to_span(span, diag, recovery_attempts=0)
 
                         if diag.is_recoverable:
-                            recovery_attempts = 1
-                            recovery_max_tokens = Config.GEMMA_API_RECOVERY_MAX_TOKENS
-                            if diag.failure_category in {"output_truncated", "output_token_truncated"}:
-                                reduced_payload = [
-                                    {
-                                        "id": f.id,
-                                        "category": f.category.value,
-                                        "title": f.title[:80],
-                                        "file_path": f.file_path,
-                                        "evidence": (f.evidence or "")[:60],
-                                        "severity": f.severity.value,
-                                    }
-                                    for f in chunk[:2]
-                                ]
-                                recovery_prompt = (
-                                    f"{SYSTEM_INSTRUCTION}\n"
-                                    f"Previous response was truncated. Review this reduced subset of {len(reduced_payload)} findings concisely:\n"
-                                    f"{json.dumps(reduced_payload, indent=2)}\n\n"
-                                    f"Return ONLY a valid JSON array of objects without conversational preamble or markdown code blocks."
+                            elapsed_batch = time.time() - t_batch_start
+                            remaining_batch_budget = batch_budget - elapsed_batch
+                            if remaining_batch_budget < min_required_budget:
+                                logger.warning(
+                                    "Insufficient remaining batch budget (%.2fs < min required %.2fs) for recovery on batch %d/%d. Skipping recovery.",
+                                    remaining_batch_budget, min_required_budget, b_idx, total_batches
                                 )
+                                span.set_data("recovery_attempted", False)
+                                span.set_data("recovery_outcome", "skipped_insufficient_budget")
                             else:
-                                recovery_prompt = (
-                                    f"{prompt}\n\n"
-                                    f"CRITICAL: Return ONLY a valid JSON array of objects without conversational preamble or markdown code blocks."
+                                recovery_attempts = 1
+                                recovery_max_tokens = Config.GEMMA_API_RECOVERY_MAX_TOKENS
+                                if diag.failure_category in {"output_truncated", "output_token_truncated"}:
+                                    reduced_payload = [
+                                        {
+                                            "id": f.id,
+                                            "category": f.category.value,
+                                            "title": f.title[:80],
+                                            "file_path": f.file_path,
+                                            "evidence": (f.evidence or "")[:60],
+                                            "severity": f.severity.value,
+                                        }
+                                        for f in chunk[:2]
+                                    ]
+                                    recovery_prompt = (
+                                        f"{SYSTEM_INSTRUCTION}\n"
+                                        f"Previous response was truncated. Review this reduced subset of {len(reduced_payload)} findings concisely:\n"
+                                        f"{json.dumps(reduced_payload, indent=2)}\n\n"
+                                        f"Return ONLY a valid JSON array of objects without conversational preamble or markdown code blocks."
+                                    )
+                                else:
+                                    recovery_prompt = (
+                                        f"{prompt}\n\n"
+                                        f"CRITICAL: Return ONLY a valid JSON array of objects without conversational preamble or markdown code blocks."
+                                    )
+                                logger.info(
+                                    "Hosted Gemma recoverable response (%s) on batch %d/%d. Attempting bounded recovery (1/1) with %.2fs remaining budget...",
+                                    diag.failure_category, b_idx, total_batches, remaining_batch_budget
                                 )
-                            logger.info(
-                                "Hosted Gemma recoverable response (%s) on batch %d/%d. Attempting bounded recovery (1/1)...",
-                                diag.failure_category, b_idx, total_batches
-                            )
-                            rec_response = self._generate_with_retry(
-                                recovery_prompt, client, span=span, max_output_tokens=recovery_max_tokens
-                            )
+                                rec_response = self._generate_with_retry(
+                                    recovery_prompt, client, span=span, max_output_tokens=recovery_max_tokens, time_budget_seconds=remaining_batch_budget
+                                )
                             rec_diag = extract_response_diagnostics(rec_response, max_expected_tokens=recovery_max_tokens)
 
                             if rec_diag.extracted_text:
@@ -1004,11 +1028,12 @@ class GemmaApiProvider(BaseAIProvider):
                     # Controlled bounded recovery attempt (at most 1) sharing the remaining patch budget
                     elapsed_so_far = time.time() - t_patch_start
                     remaining_for_recovery = patch_budget - elapsed_so_far
+                    min_required_budget = MIN_GOOGLE_DEADLINE_SECONDS + 0.5
 
-                    if remaining_for_recovery < 5.0:
+                    if remaining_for_recovery < min_required_budget:
                         logger.warning(
-                            "Insufficient remaining patch budget (%.2fs < 5.0s) for recovery on finding %s. Skipping recovery.",
-                            remaining_for_recovery, finding.id
+                            "Insufficient remaining patch budget (%.2fs < min required %.2fs) for recovery on finding %s. Skipping recovery.",
+                            remaining_for_recovery, min_required_budget, finding.id
                         )
                         span.set_data("recovery_attempted", False)
                         span.set_data("recovery_outcome", "skipped_insufficient_budget")

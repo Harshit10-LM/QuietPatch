@@ -292,3 +292,118 @@ def test_concurrent_web_requests_safe_access(client):
 
     assert len(errors) == 0, f"Concurrent requests encountered errors: {errors}"
 
+
+def test_app_creation_and_health_check_make_no_ai_calls_and_launch_no_scans():
+    """Application creation and /api/health make no Google Gen AI calls and launch no background scans."""
+    import os
+    import threading
+    import time
+    from unittest.mock import MagicMock, patch
+    from backend.ai.agent_service import AgentService
+
+    mock_client = MagicMock()
+
+    # Simulate production environment: non-debug, AI_PROVIDER="gemma_api", PYTEST_CURRENT_TEST unset
+    orig_pytest_env = os.environ.pop("PYTEST_CURRENT_TEST", None)
+    try:
+        with patch.object(Config, "AI_PROVIDER", "gemma_api"), \
+             patch("backend.ai.gemma_api_provider.GemmaApiProvider._get_client", return_value=mock_client), \
+             patch.object(AgentService, "execute_maintenance_run") as mock_exec:
+
+            prod_app = create_app()
+            prod_app.debug = False
+
+            # Wait briefly to ensure no daemon thread is spawned
+            time.sleep(0.1)
+
+            # Assert no background thread was spawned for sample init
+            active_threads = [t.name for t in threading.enumerate()]
+            assert "quietpatch-sample-init" not in active_threads
+
+            with prod_app.test_client() as test_client:
+                # 1. Health check returns 200 without invoking AI or scans
+                health_res = test_client.get("/api/health")
+                assert health_res.status_code == 200
+                assert health_res.get_json()["status"] == "ok"
+
+                # 2. Runs store is completely empty
+                scans_res = test_client.get("/api/scans")
+                assert scans_res.status_code == 200
+                assert scans_res.get_json() == []
+
+            # 3. Model inference was never called, and execute_maintenance_run was never called
+            assert mock_client.models.generate_content.call_count == 0
+            assert mock_exec.call_count == 0
+    finally:
+        if orig_pytest_env is not None:
+            os.environ["PYTEST_CURRENT_TEST"] = orig_pytest_env
+
+
+def test_default_sample_project_loading_does_not_initiate_scan(client):
+    """Listing repositories or validating sample repository makes no AI calls and creates no maintenance runs."""
+    from unittest.mock import MagicMock, patch
+
+    mock_client = MagicMock()
+    with patch("backend.ai.gemma_api_provider.GemmaApiProvider._get_client", return_value=mock_client):
+        # 1. Listing repositories
+        rep_res = client.get("/api/repositories")
+        assert rep_res.status_code == 200
+
+        # 2. Validating sample repository
+        val_res = client.post("/api/repositories/validate", json={"type": "sample", "path": "sample-repo"})
+        assert val_res.status_code == 200
+
+        # 3. Checking providers status
+        status_res = client.get("/api/providers/status")
+        assert status_res.status_code == 200
+
+        # 4. Scans must remain empty
+        scans_res = client.get("/api/scans")
+        assert scans_res.status_code == 200
+        assert len(scans_res.get_json()) == 0
+
+        # 0 model calls made
+        assert mock_client.models.generate_content.call_count == 0
+
+
+def test_duplicate_demo_scan_submission_prevented(client):
+    """Submitting a demo scan while an active maintenance run on the sample repository exists returns HTTP 409 Conflict."""
+    import threading
+    import time
+    from unittest.mock import patch
+    from backend.ai.agent_service import AgentService
+
+    block_event = threading.Event()
+
+    def mock_init(self, name):
+        provider = AgentService._init_provider(self, name)
+        orig = provider.analyze_and_prioritize
+
+        def slow_analyze(findings, run_id=None):
+            block_event.wait(timeout=5.0)
+            return orig(findings, run_id=run_id)
+
+        provider.analyze_and_prioritize = slow_analyze
+        return provider
+
+    with patch.object(AgentService, "_init_provider", mock_init):
+        # Start a scan on sample repo
+        res1 = client.post("/api/scans", json={"type": "sample", "provider": "demo"})
+        assert res1.status_code == 202
+        run1_id = res1.get_json()["id"]
+
+        # Attempt to run demo scan on same sample repo while run1 is active
+        res2 = client.post("/api/demo/scan")
+        assert res2.status_code == 409
+        err_data = res2.get_json()
+        assert "already active" in err_data["error"]
+        assert err_data["run"]["id"] == run1_id
+
+        block_event.set()
+
+    # Wait for completion
+    for _ in range(40):
+        time.sleep(0.05)
+        if client.get(f"/api/scans/{run1_id}").get_json()["status"] == "completed":
+            break
+

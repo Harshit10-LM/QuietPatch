@@ -60,32 +60,9 @@ def create_app() -> Flask:
     patch_service = PatchService()
     verification_service = VerificationService()
 
-    # Pre-populate sample run so the first dashboard visit is immediately populated!
-    # During automated testing (pytest), skip pre-population to keep test execution fast and deterministic
-    is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
-    if not os.environ.get("PYTEST_CURRENT_TEST") and not app.config.get("TESTING") and (is_reloader_child or not app.debug):
-        def _init_sample_run():
-            try:
-                if Config.SAMPLE_REPO_PATH.exists():
-                    sample_agent = AgentService(provider_name=Config.AI_PROVIDER)
-                    initial_run = sample_agent.execute_maintenance_run(
-                        repo_path=Config.SAMPLE_REPO_PATH,
-                        repo_name="NovaTask (Sample Project)",
-                        repo_type="sample",
-                        run_id="run-sample-01",
-                    )
-                    with runs_lock:
-                        runs_store[initial_run.id] = initial_run
-                    logger.info(
-                        "Initialized default sample run '%s' with %d findings (provider=%s).",
-                        initial_run.id,
-                        len(initial_run.findings),
-                        Config.AI_PROVIDER,
-                    )
-            except Exception as e:
-                logger.warning("Could not pre-populate sample run: %s", e)
-
-        threading.Thread(target=_init_sample_run, daemon=True, name="quietpatch-sample-init").start()
+    # NOTE: Startup and health checks must never launch background AI scans.
+    # Maintenance runs and AI analysis are strictly initiated by explicit user action
+    # (e.g. POST /api/scans or POST /api/demo/scan).
 
     # =========================================================================
     # System and Config Endpoints
@@ -269,6 +246,15 @@ def create_app() -> Flask:
     @app.route("/api/demo/scan", methods=["POST"])
     def start_demo_scan():
         """Fast 1-click demonstration scan of bundled sample repository."""
+        resolved_str = str(Config.SAMPLE_REPO_PATH)
+        with runs_lock:
+            for existing in runs_store.values():
+                if existing.status in ACTIVE_STATUSES and existing.repository_path == resolved_str:
+                    return jsonify({
+                        "error": f"A maintenance run ({existing.id}) is already active for the sample repository.",
+                        "run": existing.model_dump(),
+                    }), 409
+
         agent = AgentService(provider_name="demo")
         run = agent.execute_maintenance_run(
             repo_path=Config.SAMPLE_REPO_PATH,
