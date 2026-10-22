@@ -67,11 +67,18 @@ export const MaintenanceRunPage: React.FC<MaintenanceRunPageProps> = ({
     return isScanning ? 'running' : 'pending';
   };
 
+  const isTerminalRun = currentRun ? ['completed', 'failed', 'cancelled'].includes(currentRun.status) : false;
   const analysisStage = currentRun?.stages?.['analysis'];
-  const hasAnalysisIssue =
-    analysisStage &&
-    (analysisStage.status === 'failed' || analysisStage.status === 'partial') ||
-    (currentRun && currentRun.findings.some((f) => !f.ai_assisted && !f.is_demo));
+  const isAnalysisActivelyRunning = !isTerminalRun && (
+    ['queued', 'initializing', 'discovering', 'scanning', 'analyzing'].includes(currentRun?.status || '') ||
+    analysisStage?.status === 'running' ||
+    analysisStage?.status === 'pending'
+  );
+
+  const hasAnalysisIssue = !isAnalysisActivelyRunning && currentRun && (
+    (analysisStage && (analysisStage.status === 'failed' || analysisStage.status === 'partial')) ||
+    (isTerminalRun && currentRun.findings.length > 0 && currentRun.findings.some((f) => !f.ai_assisted && !f.is_demo))
+  );
 
   return (
     <div className="space-y-6">
@@ -159,11 +166,11 @@ export const MaintenanceRunPage: React.FC<MaintenanceRunPageProps> = ({
             </div>
             <div>
               <span className="text-slate-500 block">Findings</span>
-              <span className="text-amber-400 font-semibold">{currentRun.findings.length}</span>
+              <span className="text-amber-400 font-semibold">{(currentRun.findings || []).length}</span>
             </div>
             <div>
               <span className="text-slate-500 block">Patches</span>
-              <span className="text-emerald-400 font-semibold">{currentRun.patches.length}</span>
+              <span className="text-emerald-400 font-semibold">{(currentRun.patches || []).length}</span>
             </div>
           </div>
         </div>
@@ -180,7 +187,9 @@ export const MaintenanceRunPage: React.FC<MaintenanceRunPageProps> = ({
                   ? (currentRun?.ai_provider === 'gemma_api'
                       ? 'Hosted Gemma AI Analysis Failed'
                       : 'Local Gemma AI Inference Timed Out or Failed')
-                  : 'Partial Gemma AI Analysis Completed'}
+                  : analysisStage?.status === 'partial'
+                  ? 'Partial Gemma AI Analysis Completed'
+                  : 'Some Findings Awaiting Gemma AI Evaluation'}
               </h4>
               <p className="text-amber-300/80 mt-0.5 text-[11px]">
                 {analysisStage?.details ||

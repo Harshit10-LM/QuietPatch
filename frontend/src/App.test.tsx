@@ -205,3 +205,127 @@ describe('API Error Handling and Display', () => {
   });
 });
 
+describe('MaintenanceRunPage and FindingsPage Alert State Mapping', () => {
+  const mockRunningRun: any = {
+    id: 'run-active-123',
+    repository_path: '/repos/sample',
+    repository_name: 'sample',
+    status: 'analyzing',
+    started_at: '2026-10-22T08:00:00Z',
+    completed_at: null,
+    total_files: 10,
+    total_findings: 5,
+    files_scanned: 10,
+    stages: {
+      initialization: { name: 'initialization', status: 'completed', duration_seconds: 0.1 },
+      discovery: { name: 'discovery', status: 'completed', duration_seconds: 0.2 },
+      scan: { name: 'scan', status: 'completed', duration_seconds: 0.5 },
+      analysis: { name: 'analysis', status: 'running', duration_seconds: 5.0 },
+      prioritization: { name: 'prioritization', status: 'pending', duration_seconds: 0 },
+      proposal: { name: 'proposal', status: 'pending', duration_seconds: 0 },
+      verification: { name: 'verification', status: 'pending', duration_seconds: 0 },
+      report: { name: 'report', status: 'pending', duration_seconds: 0 },
+    },
+    findings: [
+      {
+        id: 'f-1',
+        category: 'configuration',
+        title: 'Finding 1',
+        file_path: 'conf.py',
+        line_number: 10,
+        severity: 'high',
+        evidence: 'key=""',
+        explanation: 'Needs key',
+        suggested_action: 'Add key',
+        estimated_effort_mins: 5,
+        verification_status: 'unverified',
+        ai_assisted: false,
+        is_demo: false,
+      },
+    ],
+    patches: [],
+    proposed_patches: [],
+    ai_provider: 'gemma_api',
+    model_name: 'gemma-4-26b-a4b-it',
+  };
+
+  const mockCompletedPartialRun: any = {
+    ...mockRunningRun,
+    id: 'run-partial-456',
+    status: 'completed',
+    completed_at: '2026-10-22T08:02:00Z',
+    stages: {
+      ...mockRunningRun.stages,
+      analysis: { name: 'analysis', status: 'partial', duration_seconds: 15.0 },
+      prioritization: { name: 'prioritization', status: 'completed', duration_seconds: 0.5 },
+      proposal: { name: 'proposal', status: 'completed', duration_seconds: 2.0 },
+      verification: { name: 'verification', status: 'completed', duration_seconds: 0.5 },
+      report: { name: 'report', status: 'completed', duration_seconds: 0.1 },
+    },
+  };
+
+  it('MaintenanceRunPage does NOT show partial/failed warning while actively analyzing', async () => {
+    const { MaintenanceRunPage } = await import('./pages/MaintenanceRunPage');
+    render(
+      <MaintenanceRunPage
+        currentRun={mockRunningRun}
+        runs={[mockRunningRun]}
+        onSelectRun={() => {}}
+        onNavigate={() => {}}
+        isScanning={true}
+      />
+    );
+
+    // Banner should NOT appear while actively running
+    expect(screen.queryByText(/Partial Gemma AI Analysis Completed/i)).toBeNull();
+    expect(screen.queryByText(/Gemma AI Analysis Failed/i)).toBeNull();
+    expect(screen.queryByText(/Findings Awaiting Gemma AI Evaluation/i)).toBeNull();
+  });
+
+  it('MaintenanceRunPage DOES show Partial Gemma AI Analysis Completed when run is completed with partial stage', async () => {
+    const { MaintenanceRunPage } = await import('./pages/MaintenanceRunPage');
+    render(
+      <MaintenanceRunPage
+        currentRun={mockCompletedPartialRun}
+        runs={[mockCompletedPartialRun]}
+        onSelectRun={() => {}}
+        onNavigate={() => {}}
+        isScanning={false}
+      />
+    );
+
+    expect(screen.getByText(/Partial Gemma AI Analysis Completed/i)).toBeDefined();
+  });
+
+  it('FindingsPage does NOT show Retry AI banner while run is actively analyzing', async () => {
+    const { FindingsPage } = await import('./pages/FindingsPage');
+    render(
+      <FindingsPage
+        currentRun={mockRunningRun}
+        onProposeFix={async () => {}}
+        onNavigateToQueue={() => {}}
+        isProposingFix={false}
+      />
+    );
+
+    expect(screen.queryByText(/Some Findings Awaiting Gemma AI Evaluation/i)).toBeNull();
+  });
+
+  it('FindingsPage DOES show Retry AI banner when run is completed with unassisted findings', async () => {
+    const { FindingsPage } = await import('./pages/FindingsPage');
+    render(
+      <FindingsPage
+        currentRun={mockCompletedPartialRun}
+        onProposeFix={async () => {}}
+        onNavigateToQueue={() => {}}
+        isProposingFix={false}
+        onRetryAi={async () => {}}
+      />
+    );
+
+    expect(screen.getByText(/Some Findings Awaiting Gemma AI Evaluation/i)).toBeDefined();
+    expect(screen.getByRole('button', { name: /Retry AI Analysis/i })).toBeDefined();
+  });
+});
+
+

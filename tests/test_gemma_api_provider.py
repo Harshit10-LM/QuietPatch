@@ -22,6 +22,7 @@ from backend.ai.gemma_api_provider import (
     sanitize_error_message,
 )
 from backend.app import create_app
+from backend.config import Config
 from backend.models import Finding, FindingCategory, PatchStatus, ProposedPatch, Severity
 from backend.telemetry.tracing import init_sentry
 
@@ -1208,3 +1209,183 @@ def test_sentry_spans_report_failures_without_secrets(tmp_path):
     assert fake_token not in analysis_stage.details
     assert "/Users/harshu" not in analysis_stage.details
     assert "[REDACTED" in analysis_stage.details
+
+
+def test_retry_after_header_respected_and_completes_batch():
+    """1. HTTP 500 with Retry-After header followed by a successful retry completes the batch."""
+    mock_client = MagicMock()
+    err = genai_errors.ServerError(500, "Internal Server Error")
+    mock_resp_err = MagicMock()
+    mock_resp_err.headers = {"Retry-After": "0.05"}
+    err.response = mock_resp_err
+
+    mock_resp_ok = MagicMock()
+    mock_resp_ok.text = json.dumps([
+        {
+            "id": "f-retry-after",
+            "severity": "high",
+            "explanation": "Resolved after transient 500",
+            "suggested_action": "Verify fix",
+        }
+    ])
+
+    mock_client.models.generate_content.side_effect = [err, mock_resp_ok]
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=2, backoff_factor=0.01)
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-retry-after",
+        category=FindingCategory.CONFIGURATION,
+        title="Retry-After test finding",
+        file_path="config.py",
+        evidence="api_key = ''",
+        explanation="Default explanation",
+        suggested_action="Default action",
+        severity=Severity.LOW,
+    )
+
+    with patch.object(Config, "GEMMA_API_BATCH_SIZE", 2):
+        analyzed = provider.analyze_and_prioritize([finding], run_id="run-ra-test")
+
+    assert mock_client.models.generate_content.call_count == 2
+    assert analyzed[0].ai_assisted is True
+    assert analyzed[0].severity == Severity.HIGH
+    assert analyzed[0].explanation == "Resolved after transient 500"
+
+
+def test_all_diagnostic_categories_classified_correctly():
+    """4. Empty, blocked, malformed, truncated, transient, and permanent outcomes are classified correctly."""
+    # Safety blocked
+    mock_safety = MagicMock()
+    mock_safety.text = None
+    mock_safety.candidates = [MagicMock(finish_reason="SAFETY", content=None)]
+    diag_safety = extract_response_diagnostics(mock_safety)
+    assert diag_safety.canonical_category == "safety_blocked"
+    assert diag_safety.is_recoverable is False
+
+    # Truncated (MAX_TOKENS)
+    mock_trunc = MagicMock()
+    mock_trunc.text = "{\"incomplete\": "
+    mock_trunc.candidates = [MagicMock(finish_reason="MAX_TOKENS", content=MagicMock(parts=[MagicMock(text="{\"incomplete\": ", thought=False)]))]
+    diag_trunc = extract_response_diagnostics(mock_trunc)
+    assert diag_trunc.canonical_category == "output_truncated"
+    assert diag_trunc.is_recoverable is True
+
+    # Empty candidates
+    mock_empty = MagicMock()
+    mock_empty.text = None
+    mock_empty.candidates = []
+    diag_empty = extract_response_diagnostics(mock_empty)
+    assert diag_empty.canonical_category == "empty_response"
+    assert diag_empty.is_recoverable is True
+
+    # Absent content
+    mock_absent = MagicMock()
+    mock_absent.text = None
+    mock_absent.candidates = [MagicMock(finish_reason="STOP", content=None)]
+    diag_absent = extract_response_diagnostics(mock_absent)
+    assert diag_absent.canonical_category == "empty_response"
+    assert diag_absent.is_recoverable is True
+
+    # Valid response
+    mock_ok = MagicMock()
+    mock_ok.text = "[{\"id\": \"1\"}]"
+    mock_ok.candidates = [MagicMock(finish_reason="STOP", content=MagicMock(parts=[MagicMock(text="[{\"id\": \"1\"}]", thought=False)]))]
+    diag_ok = extract_response_diagnostics(mock_ok)
+    assert diag_ok.canonical_category == "success"
+    assert diag_ok.failure_category == "success"
+
+
+def test_permanent_4xx_not_retried_at_all():
+    """3. Permanent 4xx errors (400, 401, 403, 404) fail immediately without retry loops."""
+    for status_code in [400, 401, 403, 404]:
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = genai_errors.ClientError(status_code, f"HTTP {status_code} client error")
+
+        provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=3)
+        provider._client = mock_client
+
+        with pytest.raises(GemmaApiError) as exc_info:
+            provider._generate_with_retry("test prompt", mock_client)
+
+        assert exc_info.value.code == status_code
+        # Must have failed on the very first attempt without looping
+        assert mock_client.models.generate_content.call_count == 1
+
+
+def test_multibatch_partial_success_preserves_successful_findings_and_patches(tmp_path):
+    """6 & 7. Multi-batch analysis preserves findings from successful batches when a subsequent batch fails."""
+    f1 = Finding(id="f1", category=FindingCategory.CONFIGURATION, title="T1", file_path="a.py", evidence="x=1", explanation="e1", suggested_action="a1")
+    f2 = Finding(id="f2", category=FindingCategory.CONFIGURATION, title="T2", file_path="b.py", evidence="x=2", explanation="e2", suggested_action="a2")
+    f3 = Finding(id="f3", category=FindingCategory.CONFIGURATION, title="T3", file_path="c.py", evidence="x=3", explanation="e3", suggested_action="a3")
+    f4 = Finding(id="f4", category=FindingCategory.CONFIGURATION, title="T4", file_path="d.py", evidence="x=4", explanation="e4", suggested_action="a4")
+
+    mock_client = MagicMock()
+
+    # Batch 1 (f1, f2) succeeds
+    resp_batch1 = MagicMock()
+    resp_batch1.text = json.dumps([
+        {"id": "f1", "severity": "high", "explanation": "f1 evaluated", "suggested_action": "fix 1"},
+        {"id": "f2", "severity": "medium", "explanation": "f2 evaluated", "suggested_action": "fix 2"},
+    ])
+
+    # Batch 2 (f3, f4) fails with 500 error
+    err_batch2 = genai_errors.ServerError(500, "Google upstream failure on batch 2")
+
+    # Patch proposal response for f1 succeeds
+    patch_resp = MagicMock()
+    patch_resp.text = json.dumps({
+        "change_summary": "Update a.py",
+        "proposed_content": "x = 100\n",
+        "explanation": "Fix explanation",
+        "risks_assumptions": "none",
+        "suggested_verification": "pytest",
+    })
+
+    # Side effects: batch 1 succeeds, batch 2 fails on both retry attempts, patch generation succeeds
+    mock_client.models.generate_content.side_effect = [
+        resp_batch1,
+        err_batch2, err_batch2,  # Batch 2 exhausted
+        patch_resp,
+    ]
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=1, backoff_factor=0.01)
+    provider._client = mock_client
+
+    agent = AgentService(provider_name="gemma_api")
+    agent.provider = provider
+
+    # Create dummy files
+    for name in ["a.py", "b.py", "c.py", "d.py"]:
+        p = tmp_path / name
+        p.write_text("x = 1\n", encoding="utf-8")
+
+    with patch.object(Config, "GEMMA_API_BATCH_SIZE", 2), \
+         patch.object(agent.scan_engine, "discover_files", return_value=([tmp_path / "a.py"], 10)), \
+         patch.object(agent.scan_engine, "run_scanners", return_value=([f1, f2, f3, f4], {})):
+
+        run = agent.execute_maintenance_run(
+            repo_path=tmp_path,
+            repo_name="MultiBatchRepo",
+            repo_type="local",
+            run_id="run-multibatch",
+        )
+
+    # Batch 1 findings MUST be AI-assisted and preserved
+    assert f1.ai_assisted is True
+    assert f1.severity == Severity.HIGH
+    assert f2.ai_assisted is True
+    assert f2.severity == Severity.MEDIUM
+
+    # Batch 2 findings MUST remain unassisted for retry
+    assert f3.ai_assisted is False
+    assert f4.ai_assisted is False
+
+    # Stage 4 must report 'partial'
+    assert run.stages["analysis"].status == "partial"
+    assert "2/4" in run.stages["analysis"].details
+
+    # Proposals generated for assisted findings MUST be preserved
+    assert len(run.patches) >= 1
+    assert run.patches[0].finding_id == "f1"

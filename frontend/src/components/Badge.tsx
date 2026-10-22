@@ -51,6 +51,7 @@ interface VerificationBadgeProps {
 }
 
 export const VerificationBadge: React.FC<VerificationBadgeProps> = ({ status }) => {
+  const safeStatus = status || 'unverified';
   const styles: Record<VerificationStatus, string> = {
     passed: 'bg-emerald-950/80 text-emerald-400 border-emerald-800/60',
     failed: 'bg-red-950/80 text-red-400 border-red-800/60',
@@ -61,12 +62,12 @@ export const VerificationBadge: React.FC<VerificationBadgeProps> = ({ status }) 
   return (
     <span
       className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border ${
-        styles[status] || styles.unverified
+        styles[safeStatus] || styles.unverified
       }`}
     >
-      {status === 'passed' && '✓ '}
-      {status === 'failed' && '✕ '}
-      {status.charAt(0).toUpperCase() + status.slice(1)}
+      {safeStatus === 'passed' && '✓ '}
+      {safeStatus === 'failed' && '✕ '}
+      {safeStatus.charAt(0).toUpperCase() + safeStatus.slice(1)}
     </span>
   );
 };
@@ -76,6 +77,7 @@ interface PatchStatusBadgeProps {
 }
 
 export const PatchStatusBadge: React.FC<PatchStatusBadgeProps> = ({ status }) => {
+  const safeStatus = status || 'pending';
   const styles: Record<PatchStatus, string> = {
     pending: 'bg-amber-950/80 text-amber-300 border-amber-800/60',
     approved: 'bg-emerald-950/80 text-emerald-300 border-emerald-800/60',

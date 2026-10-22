@@ -19,6 +19,13 @@ SAFE_TAG_KEYS = {
     "verification_count", "repo_type", "repo_name", "app_mode",
     "command", "duration_seconds", "time_saved_minutes", "batch_index",
     "total_batches", "eligible_count", "patches_verified", "checks_passed",
+    "has_response", "candidate_count", "text_part_count", "thought_part_count",
+    "finish_reason", "block_reason", "failure_category",
+    "prompt_tokens", "candidate_tokens", "total_tokens",
+    "recovery_attempt_count", "recovery_attempted", "recovery_outcome",
+    "attempted_count", "failed_count", "successful_batches", "failed_batches",
+    "is_retry", "is_transient", "exhausted_attempts", "error_code",
+    "successful_attempt", "time_budget_exhausted", "finding_id",
 }
 
 # Mapping of human-friendly stage names to required quietpatch span operations

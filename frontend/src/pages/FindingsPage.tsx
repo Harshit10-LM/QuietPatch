@@ -107,7 +107,7 @@ export const FindingsPage: React.FC<FindingsPageProps> = ({
       </div>
 
       {/* Unassisted Findings / Retry AI Banner */}
-      {currentRun && currentRun.findings.some((f) => !f.ai_assisted && !f.is_demo) && (
+      {currentRun && ['completed', 'failed'].includes(currentRun.status) && currentRun.stages?.analysis?.status !== 'running' && currentRun.findings.some((f) => !f.ai_assisted && !f.is_demo) && (
         <div className="p-4 rounded-xl bg-amber-950/40 border border-amber-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
           <div className="flex items-start space-x-3 text-amber-300">
             <AlertCircle className="w-5 h-5 shrink-0 mt-0.5 text-amber-400" />
