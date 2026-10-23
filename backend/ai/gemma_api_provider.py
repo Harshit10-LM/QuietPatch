@@ -101,6 +101,9 @@ class ResponseDiagnostics:
         json_error_position: Optional[int] = None,
         edit_validation_category: Optional[str] = None,
         recovery_outcome: Optional[str] = None,
+        elapsed_seconds: Optional[float] = None,
+        configured_timeout_ms: Optional[int] = None,
+        attempt_number: Optional[int] = None,
     ):
         self.has_response = has_response
         self.candidate_count = candidate_count
@@ -120,6 +123,9 @@ class ResponseDiagnostics:
         self.json_error_position = json_error_position
         self.edit_validation_category = edit_validation_category
         self.recovery_outcome = recovery_outcome
+        self.elapsed_seconds = elapsed_seconds
+        self.configured_timeout_ms = configured_timeout_ms
+        self.attempt_number = attempt_number
 
     @property
     def canonical_category(self) -> str:
@@ -137,6 +143,8 @@ class ResponseDiagnostics:
             "malformed_output", "malformed_json", "no_patch_content", "invalid_diff",
             "missing_edits", "malformed_edit", "empty_old_text",
             "missing_old_text_match", "ambiguous_old_text", "overlapping_edits",
+            "empty_content", "missing_content", "invalid_operation",
+            "file_not_found_for_edit", "existing_file_overwrite_prohibited",
         }:
             return "malformed_output"
         if self.failure_category in {"invalid_target_path", "no_op_patch"}:
@@ -170,6 +178,11 @@ class ResponseDiagnostics:
             "missing_old_text_match",
             "ambiguous_old_text",
             "overlapping_edits",
+            "empty_content",
+            "missing_content",
+            "invalid_operation",
+            "file_not_found_for_edit",
+            "existing_file_overwrite_prohibited",
         }
 
     def sanitized_summary(self) -> str:
@@ -178,6 +191,8 @@ class ResponseDiagnostics:
             if self.prompt_tokens is not None or self.candidate_tokens is not None
             else "none"
         )
+        timeout_str = f"{self.configured_timeout_ms}ms" if self.configured_timeout_ms is not None else "none"
+        elapsed_str = f"{self.elapsed_seconds:.2f}s" if self.elapsed_seconds is not None else "none"
         return (
             f"finding_id={self.finding_id or 'none'}, has_response={self.has_response}, "
             f"candidates={self.candidate_count}, text_parts={self.text_part_count}, "
@@ -185,8 +200,10 @@ class ResponseDiagnostics:
             f"resembles_json={self.resembles_json}, is_fenced={self.is_fenced}, "
             f"json_err={self.json_error_category or 'none'}(pos={self.json_error_position if self.json_error_position is not None else 'none'}), "
             f"edit_err={self.edit_validation_category or 'none'}, "
+            f"elapsed={elapsed_str}, timeout={timeout_str}, attempt={self.attempt_number or 'none'}, "
             f"tokens={tokens_summary}, category={self.failure_category or 'none'}"
         )
+
 
 
 def extract_retry_after(exc: Exception) -> Optional[float]:
@@ -226,7 +243,7 @@ def classify_patch_error(exc: Exception) -> str:
         return "invalid_target_path"
     if "no_op_patch" in msg or "identical to original" in msg or "empty unified diff" in msg or "no change" in msg:
         return "no_op_patch"
-    if any(k in msg for k in ("missing_old_text", "ambiguous_old_text", "overlapping_edits", "malformed_edit", "missing_edits", "empty_old_text")):
+    if any(k in msg for k in ("missing_old_text", "ambiguous_old_text", "overlapping_edits", "malformed_edit", "missing_edits", "empty_old_text", "empty_content", "missing_content", "invalid_operation", "file_not_found_for_edit", "existing_file_overwrite_prohibited")):
         return "malformed_output"
     if isinstance(exc, json.JSONDecodeError) or "malformed" in msg or "jsondecodeerror" in exc_type or "invalid_diff" in msg or "invalid_json" in msg:
         return "malformed_output"
@@ -379,6 +396,10 @@ def extract_response_diagnostics(
     else:
         failure_cat = "success"
 
+    elapsed_sec = getattr(response, "_qp_elapsed_seconds", None)
+    timeout_ms = getattr(response, "_qp_configured_timeout_ms", None)
+    attempt_num = getattr(response, "_qp_attempt_number", None)
+
     return ResponseDiagnostics(
         has_response=True,
         candidate_count=candidate_count,
@@ -391,6 +412,9 @@ def extract_response_diagnostics(
         total_tokens=total_tokens,
         extracted_text=extracted,
         failure_category=failure_cat,
+        elapsed_seconds=elapsed_sec,
+        configured_timeout_ms=timeout_ms,
+        attempt_number=attempt_num,
     )
 
 
@@ -497,6 +521,10 @@ def validate_and_apply_structured_edits(
     """Validates structured edit operations against file contents and security policies,
     applies them in-memory, and deterministically generates a standard unified diff.
 
+    Supports two explicit operations:
+    1. 'create_file': Creates a new repository file (requires non-empty 'content', rejects existing files).
+    2. 'replace_text': Modifies an existing file via exact anchors (requires non-empty 'old_text', match_count == 1).
+
     Returns:
     (status, patch_data, error_detail, edit_err_category)
     """
@@ -532,7 +560,92 @@ def validate_and_apply_structured_edits(
         except Exception:
             return "invalid_target_path", None, f"Target path escapes repository root: {target_path}", "escapes_repository_root"
 
-    # 4. Edits array validation
+    # Determine operation ('create_file' or 'replace_text')
+    operation = candidate_dict.get("operation")
+    if not operation:
+        if "content" in candidate_dict and "edits" not in candidate_dict:
+            operation = "create_file"
+        elif "edits" in candidate_dict:
+            operation = "replace_text"
+        else:
+            return "missing_operation", None, "Structured edit proposal must specify 'operation' ('create_file' or 'replace_text')", "missing_operation"
+
+    if operation not in {"create_file", "replace_text"}:
+        return "invalid_operation", None, f"Unsupported operation '{operation}'. Supported operations: 'create_file', 'replace_text'", "invalid_operation"
+
+    # ==========================================
+    # Operation A: create_file
+    # ==========================================
+    if operation == "create_file":
+        # Target file must not already exist in the repository
+        file_already_exists = False
+        if repo_path:
+            full_target = (repo_path / target_clean.lstrip("/")).resolve()
+            if full_target.exists() and full_target.is_file() and full_target.stat().st_size > 0:
+                file_already_exists = True
+        elif original_content and original_content.strip():
+            file_already_exists = True
+
+        if file_already_exists:
+            return "existing_file_overwrite_prohibited", None, f"Cannot create '{target_path}' because file already exists in repository", "existing_file_overwrite_prohibited"
+
+        content = candidate_dict.get("content")
+        if content is None or not isinstance(content, str):
+            return "missing_content", None, "Candidate create_file operation must have a 'content' string", "missing_content"
+        if not content.strip():
+            return "empty_content", None, "Candidate create_file operation must have non-empty 'content'", "empty_content"
+
+        # Deterministic unified diff using difflib
+        orig_lines = []
+        mod_lines = content.splitlines(keepends=True)
+        diff_lines = list(difflib.unified_diff(
+            orig_lines,
+            mod_lines,
+            fromfile=f"a/{finding.file_path}",
+            tofile=f"b/{finding.file_path}",
+        ))
+        diff_str = "".join(diff_lines)
+        if not diff_str.strip():
+            return "no_op_patch", None, "Unified diff generated for create_file is empty", "no_op_patch"
+
+        # In-memory syntax verification if applicable
+        if finding.file_path.endswith(".py"):
+            try:
+                compile(content, finding.file_path, "exec")
+            except SyntaxError as syn_err:
+                return "malformed_edit", None, f"Generated patch creates Python syntax error: {syn_err.msg}", "syntax_error"
+        elif finding.file_path.endswith(".json"):
+            try:
+                json.loads(content)
+            except Exception as json_err:
+                return "malformed_edit", None, f"Generated patch creates invalid JSON: {json_err}", "syntax_error"
+
+        explanation = candidate_dict.get("explanation") or finding.explanation or f"Create {finding.file_path}"
+
+        return "success", {
+            "proposed_content": content,
+            "diff": diff_str,
+            "change_summary": candidate_dict.get("explanation", f"Create {finding.file_path}"),
+            "explanation": explanation,
+            "risks_assumptions": "Low risk new file creation.",
+            "suggested_verification": f"Verify contents of {finding.file_path}.",
+        }, "", None
+
+    # ==========================================
+    # Operation B: replace_text
+    # ==========================================
+    # Verify file exists
+    file_exists = False
+    if repo_path:
+        full_target = (repo_path / target_clean.lstrip("/")).resolve()
+        if full_target.exists() and full_target.is_file():
+            file_exists = True
+    elif original_content and original_content.strip():
+        file_exists = True
+
+    if not file_exists and not original_content:
+        return "file_not_found_for_edit", None, f"Cannot edit '{target_path}' with replace_text because file does not exist in repository. Use 'create_file' operation.", "file_not_found_for_edit"
+
     edits = candidate_dict.get("edits")
     if edits is None or not isinstance(edits, list) or len(edits) == 0:
         return "missing_edits", None, "Candidate must contain a non-empty 'edits' list", "missing_edits"
@@ -550,9 +663,8 @@ def validate_and_apply_structured_edits(
         new_text = edit["new_text"]
 
         if not old_text:
-            return "empty_old_text", None, f"Edit at index {idx} 'old_text' cannot be empty", "empty_old_text"
+            return "empty_old_text", None, f"Edit at index {idx} 'old_text' cannot be empty for replace_text", "empty_old_text"
 
-        # Check occurrence count in original_content
         match_count = original_content.count(old_text)
         if match_count == 0:
             return "missing_old_text_match", None, f"Edit at index {idx} 'old_text' not found in file content", "missing_old_text_match"
@@ -563,7 +675,7 @@ def validate_and_apply_structured_edits(
         end_pos = start_pos + len(old_text)
         spans.append((start_pos, end_pos, edit, idx))
 
-    # 5. Overlap detection
+    # Overlap detection
     sorted_spans = sorted(spans, key=lambda s: s[0])
     for i in range(len(sorted_spans) - 1):
         cur_start, cur_end, _, cur_idx = sorted_spans[i]
@@ -571,7 +683,7 @@ def validate_and_apply_structured_edits(
         if cur_end > nxt_start:
             return "overlapping_edits", None, f"Edit {cur_idx} and edit {nxt_idx} overlap in file content", "overlapping_edits"
 
-    # 6. Apply edits in-memory preserving line endings and unrelated content
+    # In-memory application
     pieces = []
     last_pos = 0
     for start_pos, end_pos, edit, _ in sorted_spans:
@@ -584,7 +696,7 @@ def validate_and_apply_structured_edits(
     if modified_content == original_content:
         return "no_op_patch", None, "Proposed edits produce no modification to original file", "no_op_patch"
 
-    # 7. Deterministic diff generation using Python difflib
+    # Deterministic diff generation
     orig_lines = original_content.splitlines(keepends=True)
     mod_lines = modified_content.splitlines(keepends=True)
     diff_lines = list(difflib.unified_diff(
@@ -597,7 +709,7 @@ def validate_and_apply_structured_edits(
     if not diff_str.strip():
         return "no_op_patch", None, "Unified diff generated from edits is empty", "no_op_patch"
 
-    # 8. In-memory syntax verification if applicable
+    # In-memory syntax verification
     if finding.file_path.endswith(".py"):
         try:
             compile(modified_content, finding.file_path, "exec")
@@ -619,6 +731,7 @@ def validate_and_apply_structured_edits(
         "risks_assumptions": "Low risk minimal structured edit.",
         "suggested_verification": "Check syntax and run regression tests.",
     }, "", None
+
 
 
 def clean_json_text(text: Optional[str]) -> str:
@@ -911,8 +1024,13 @@ def extract_patch_candidate(
         diag.json_error_category = json_meta["json_error_category"]
         diag.json_error_position = json_meta["json_error_position"]
 
-    # Case 1: Primary contract - structured edits
-    if candidate_dict and ("edits" in candidate_dict or "target_path" in candidate_dict):
+    # Case 1: Primary contract - structured edits (create_file or replace_text)
+    if candidate_dict and (
+        "operation" in candidate_dict
+        or "edits" in candidate_dict
+        or "content" in candidate_dict
+        or "target_path" in candidate_dict
+    ):
         status, data, err_msg, edit_cat = validate_and_apply_structured_edits(
             candidate_dict, finding, original_content, repo_path
         )
@@ -1051,7 +1169,7 @@ def log_sanitized_diagnostics(
         "Hosted Gemma diagnostics [%s]: finding_id=%s, provider=%s, model=%s, has_response=%s, "
         "candidates=%d, text_parts=%d, finish_reason=%s, block_reason=%s, "
         "resembles_json=%s, is_fenced=%s, json_error=%s, json_pos=%s, edit_error=%s, "
-        "recovery_outcome=%s, usage=%s, recovery_attempts=%d, failure_category=%s",
+        "recovery_outcome=%s, elapsed_sec=%.2f, timeout_ms=%s, attempt=%s, usage=%s, recovery_attempts=%d, failure_category=%s",
         stage,
         diag.finding_id or "none",
         provider,
@@ -1067,6 +1185,9 @@ def log_sanitized_diagnostics(
         diag.json_error_position if diag.json_error_position is not None else "none",
         diag.edit_validation_category or "none",
         diag.recovery_outcome or "none",
+        diag.elapsed_seconds if diag.elapsed_seconds is not None else 0.0,
+        diag.configured_timeout_ms if diag.configured_timeout_ms is not None else "none",
+        diag.attempt_number if diag.attempt_number is not None else "none",
         tokens_meta,
         recovery_attempts,
         diag.failure_category or "none",
@@ -1100,6 +1221,12 @@ def record_diagnostics_to_span(
         span.set_tag("edit_validation_category", diag.edit_validation_category)
     if diag.recovery_outcome:
         span.set_tag("recovery_outcome", diag.recovery_outcome)
+    if diag.elapsed_seconds is not None:
+        span.set_data("elapsed_seconds", diag.elapsed_seconds)
+    if diag.configured_timeout_ms is not None:
+        span.set_data("configured_timeout_ms", diag.configured_timeout_ms)
+    if diag.attempt_number is not None:
+        span.set_data("attempt_number", diag.attempt_number)
     if diag.prompt_tokens is not None:
         span.set_data("prompt_tokens", diag.prompt_tokens)
     if diag.candidate_tokens is not None:
@@ -1109,6 +1236,7 @@ def record_diagnostics_to_span(
     span.set_data("recovery_attempt_count", recovery_attempts)
     if diag.failure_category:
         span.set_tag("failure_category", diag.failure_category)
+
 
 
 def is_transient_error(exc: Exception) -> bool:
@@ -1276,6 +1404,15 @@ class GemmaApiProvider(BaseAIProvider):
             allowed_req_timeout = max(MIN_GOOGLE_DEADLINE_SECONDS, min(configured_req_timeout, remaining_budget - safety_margin))
             req_timeout_ms = int(allowed_req_timeout * 1000)
 
+            # Ensure client-level transport options also reflect the per-request timeout and attempts=1
+            if hasattr(client, "_api_client") and hasattr(client._api_client, "_http_options"):
+                try:
+                    from google import genai
+                    client._api_client._http_options.timeout = req_timeout_ms
+                    client._api_client._http_options.retry_options = genai.types.HttpRetryOptions(attempts=1)
+                except Exception:
+                    pass
+
             config = None
             try:
                 from google import genai
@@ -1309,6 +1446,12 @@ class GemmaApiProvider(BaseAIProvider):
                     kwargs["config"] = config
                 response = client.models.generate_content(**kwargs)
                 req_duration = round(time.time() - t_req, 3)
+                try:
+                    setattr(response, "_qp_elapsed_seconds", req_duration)
+                    setattr(response, "_qp_configured_timeout_ms", req_timeout_ms)
+                    setattr(response, "_qp_attempt_number", attempt)
+                except Exception:
+                    pass
                 if attempt > 1:
                     logger.info(
                         "Hosted Gemma request succeeded on attempt %d/%d (took %.2fs, total elapsed %.2fs)",
@@ -1317,6 +1460,7 @@ class GemmaApiProvider(BaseAIProvider):
                     if span:
                         span.set_data("successful_attempt", attempt)
                 return response
+
             except Exception as exc:
                 req_duration = round(time.time() - t_req, 3)
                 last_error = exc
@@ -1657,35 +1801,72 @@ class GemmaApiProvider(BaseAIProvider):
         if not client:
             return None
 
+        target_file_exists = False
+        if repo_path:
+            clean_rel = finding.file_path.strip().lstrip("/")
+            try:
+                full_f = (repo_path / clean_rel).resolve()
+                if full_f.exists() and full_f.is_file() and full_f.stat().st_size > 0:
+                    target_file_exists = True
+            except Exception:
+                pass
+        if not target_file_exists and file_content and file_content.strip():
+            target_file_exists = True
+
         bounded_content = self._bound_file_content(file_content, finding, max_chars=1600)
         bounded_evidence = (finding.evidence or "")[:200]
 
-        prompt = (
-            f"{SYSTEM_INSTRUCTION}\n"
-            f"Finding to fix:\n"
-            f"- Title: {finding.title[:150]}\n"
-            f"- File: {finding.file_path}\n"
-            f"- Evidence: {bounded_evidence}\n"
-            f"- Suggestion: {(finding.suggested_action or '')[:200]}\n\n"
-            f"Original file content of '{finding.file_path}':\n```\n{bounded_content}\n```\n\n"
-            f"Task: Propose minimal structured source edits to resolve this finding.\n"
-            f"CRITICAL INSTRUCTIONS:\n"
-            f"1. Target file MUST be '{finding.file_path}'.\n"
-            f"2. Every 'old_text' MUST match the file contents above EXACTLY ONCE.\n"
-            f"3. Make ONLY the minimal change required.\n"
-            f"4. Do NOT propose overlapping edits.\n"
-            f"5. Return ONLY a single raw JSON object matching the contract below, with no conversational text or markdown code fences:\n\n"
-            f"{{\n"
-            f'  "target_path": "{finding.file_path}",\n'
-            f'  "explanation": "concise explanation of why this fix resolves the finding",\n'
-            f'  "edits": [\n'
-            f'    {{\n'
-            f'      "old_text": "exact existing snippet from the file",\n'
-            f'      "new_text": "replacement snippet"\n'
-            f'    }}\n'
-            f'  ]\n'
-            f"}}"
-        )
+        if not target_file_exists:
+            prompt = (
+                f"{SYSTEM_INSTRUCTION}\n"
+                f"Finding to fix:\n"
+                f"- Title: {finding.title[:150]}\n"
+                f"- File: {finding.file_path}\n"
+                f"- Evidence: {bounded_evidence}\n"
+                f"- Suggestion: {(finding.suggested_action or '')[:200]}\n\n"
+                f"Target file '{finding.file_path}' does not currently exist in the repository.\n\n"
+                f"Task: Propose creating this new file to resolve the finding.\n"
+                f"CRITICAL INSTRUCTIONS:\n"
+                f"1. Target file MUST be '{finding.file_path}'.\n"
+                f"2. Use operation 'create_file'.\n"
+                f"3. Provide the complete new file content in the 'content' field.\n"
+                f"4. Return ONLY a single raw JSON object matching the contract below, with no conversational text or markdown code fences:\n\n"
+                f"{{\n"
+                f'  "operation": "create_file",\n'
+                f'  "target_path": "{finding.file_path}",\n'
+                f'  "explanation": "concise explanation of why creating this file resolves the finding",\n'
+                f'  "content": "complete new file content"\n'
+                f"}}"
+            )
+        else:
+            prompt = (
+                f"{SYSTEM_INSTRUCTION}\n"
+                f"Finding to fix:\n"
+                f"- Title: {finding.title[:150]}\n"
+                f"- File: {finding.file_path}\n"
+                f"- Evidence: {bounded_evidence}\n"
+                f"- Suggestion: {(finding.suggested_action or '')[:200]}\n\n"
+                f"Original file content of '{finding.file_path}':\n```\n{bounded_content}\n```\n\n"
+                f"Task: Propose minimal structured source edits to resolve this finding.\n"
+                f"CRITICAL INSTRUCTIONS:\n"
+                f"1. Target file MUST be '{finding.file_path}'.\n"
+                f"2. Use operation 'replace_text'.\n"
+                f"3. Every 'old_text' MUST match the file contents above EXACTLY ONCE.\n"
+                f"4. Make ONLY the minimal change required.\n"
+                f"5. Do NOT propose overlapping edits.\n"
+                f"6. Return ONLY a single raw JSON object matching the contract below, with no conversational text or markdown code fences:\n\n"
+                f"{{\n"
+                f'  "operation": "replace_text",\n'
+                f'  "target_path": "{finding.file_path}",\n'
+                f'  "explanation": "concise explanation of why this fix resolves the finding",\n'
+                f'  "edits": [\n'
+                f'    {{\n'
+                f'      "old_text": "exact existing snippet from the file",\n'
+                f'      "new_text": "replacement snippet"\n'
+                f'    }}\n'
+                f'  ]\n'
+                f"}}"
+            )
 
         patch_budget = float(Config.GEMMA_API_PATCH_TIMEOUT_SECONDS)
         patch_thinking_level = Config.GEMMA_API_PATCH_THINKING_LEVEL or "minimal"
@@ -1735,7 +1916,9 @@ class GemmaApiProvider(BaseAIProvider):
                         diag.failure_category = "no_op_patch"
                     elif candidate_status in {
                         "missing_edits", "malformed_edit", "empty_old_text",
-                        "missing_old_text_match", "ambiguous_old_text", "overlapping_edits"
+                        "missing_old_text_match", "ambiguous_old_text", "overlapping_edits",
+                        "empty_content", "missing_content", "invalid_operation",
+                        "file_not_found_for_edit", "existing_file_overwrite_prohibited"
                     }:
                         diag.failure_category = "malformed_output"
                     elif candidate_status == "invalid_json":
@@ -1777,50 +1960,82 @@ class GemmaApiProvider(BaseAIProvider):
                     recovery_max_tokens = Config.GEMMA_API_PATCH_RECOVERY_MAX_TOKENS
                     reduced_content = self._bound_file_content(file_content, finding, max_chars=1400)
 
-                    category_msg = "The previous response could not be applied."
-                    if diag.finish_reason == "MAX_TOKENS" or diag.failure_category in {"output_truncated", "output_token_truncated"}:
-                        category_msg = "The previous patch generation was truncated due to token budget limits. Propose smaller, minimal edit snippets."
-                    elif diag.edit_validation_category == "missing_old_text_match":
-                        category_msg = f"The proposed 'old_text' was not found in '{finding.file_path}'. You must provide the exact existing snippet from the file content below."
-                    elif diag.edit_validation_category == "ambiguous_old_text":
-                        category_msg = f"The proposed 'old_text' matched multiple locations in '{finding.file_path}'. Include more surrounding context so 'old_text' matches exactly once."
-                    elif diag.edit_validation_category == "overlapping_edits":
-                        category_msg = "The proposed edits overlapped in the file content. Ensure each edit operates on a distinct, non-overlapping section."
-                    elif diag.edit_validation_category in {"missing_edits", "malformed_edit", "empty_old_text"}:
-                        category_msg = "The response must contain a non-empty 'edits' list with exact 'old_text' and 'new_text' strings."
-                    elif diag.edit_validation_category == "invalid_diff" or candidate_status == "invalid_diff":
-                        category_msg = f"The previous unified diff could not apply cleanly to '{finding.file_path}'. Context lines did not match the file."
-                    elif candidate_status == "no_patch_content":
-                        category_msg = "The previous response contained explanatory text but did not provide a reviewable patch or unified diff."
+                    if not target_file_exists:
+                        category_msg = (
+                            f"Target file '{finding.file_path}' does not exist in the repository. "
+                            f"Do NOT provide 'old_text' edits. You must use operation 'create_file' with a non-empty 'content' string."
+                        )
+                        recovery_prompt = (
+                            f"{SYSTEM_INSTRUCTION}\n"
+                            f"Validation failure category: {diag.edit_validation_category or diag.json_error_category or diag.failure_category}\n"
+                            f"Correction required: {category_msg}\n\n"
+                            f"Finding to fix:\n"
+                            f"- Title: {finding.title[:150]}\n"
+                            f"- File: {finding.file_path}\n"
+                            f"- Evidence: {bounded_evidence[:150]}\n\n"
+                            f"CRITICAL INSTRUCTIONS:\n"
+                            f"1. Target file MUST be '{finding.file_path}'.\n"
+                            f"2. Use operation 'create_file'.\n"
+                            f"3. Provide complete non-empty 'content'.\n"
+                            f"4. Return ONLY a single raw JSON object matching:\n\n"
+                            f"{{\n"
+                            f'  "operation": "create_file",\n'
+                            f'  "target_path": "{finding.file_path}",\n'
+                            f'  "explanation": "concise explanation of why creating this file resolves the finding",\n'
+                            f'  "content": "complete new file content"\n'
+                            f"}}"
+                        )
                     else:
-                        category_msg = f"The previous response contained invalid or malformed JSON syntax ({diag.json_error_category or 'syntax error'}). Output valid JSON only."
+                        category_msg = "The previous response could not be applied."
+                        if diag.finish_reason == "MAX_TOKENS" or diag.failure_category in {"output_truncated", "output_token_truncated"}:
+                            category_msg = "The previous patch generation was truncated due to token budget limits. Propose smaller, minimal edit snippets."
+                        elif diag.edit_validation_category == "missing_old_text_match":
+                            category_msg = f"The proposed 'old_text' was not found in '{finding.file_path}'. You must provide the exact existing snippet from the file content below."
+                        elif diag.edit_validation_category == "ambiguous_old_text":
+                            category_msg = f"The proposed 'old_text' matched multiple locations in '{finding.file_path}'. Include more surrounding context so 'old_text' matches exactly once."
+                        elif diag.edit_validation_category == "overlapping_edits":
+                            category_msg = "The proposed edits overlapped in the file content. Ensure each edit operates on a distinct, non-overlapping section."
+                        elif diag.edit_validation_category == "empty_old_text":
+                            category_msg = f"Target file '{finding.file_path}' exists. 'old_text' cannot be empty for replace_text."
+                        elif diag.edit_validation_category in {"missing_edits", "malformed_edit"}:
+                            category_msg = "The response must contain a non-empty 'edits' list with exact 'old_text' and 'new_text' strings."
+                        elif diag.edit_validation_category == "existing_file_overwrite_prohibited":
+                            category_msg = f"File '{finding.file_path}' already exists in the repository. Use operation 'replace_text' with 'edits' instead of 'create_file'."
+                        elif diag.edit_validation_category == "invalid_diff" or candidate_status == "invalid_diff":
+                            category_msg = f"The previous unified diff could not apply cleanly to '{finding.file_path}'. Context lines did not match the file."
+                        elif candidate_status == "no_patch_content":
+                            category_msg = "The previous response contained explanatory text but did not provide a reviewable patch or unified diff."
+                        else:
+                            category_msg = f"The previous response contained invalid or malformed JSON syntax ({diag.json_error_category or 'syntax error'}). Output valid JSON only."
 
-                    recovery_prompt = (
-                        f"{SYSTEM_INSTRUCTION}\n"
-                        f"Validation failure category: {diag.edit_validation_category or diag.json_error_category or diag.failure_category}\n"
-                        f"Correction required: {category_msg}\n\n"
-                        f"Finding to fix:\n"
-                        f"- Title: {finding.title[:150]}\n"
-                        f"- File: {finding.file_path}\n"
-                        f"- Evidence: {bounded_evidence[:150]}\n\n"
-                        f"Original file content of '{finding.file_path}':\n```\n{reduced_content}\n```\n\n"
-                        f"CRITICAL INSTRUCTIONS:\n"
-                        f"1. Target file MUST be '{finding.file_path}'.\n"
-                        f"2. Every 'old_text' MUST match the file contents above EXACTLY ONCE.\n"
-                        f"3. Make ONLY the minimal change required.\n"
-                        f"4. Do NOT propose overlapping edits.\n"
-                        f"5. Return ONLY a single raw JSON object matching the contract:\n\n"
-                        f"{{\n"
-                        f'  "target_path": "{finding.file_path}",\n'
-                        f'  "explanation": "concise explanation of why this fix resolves the finding",\n'
-                        f'  "edits": [\n'
-                        f'    {{\n'
-                        f'      "old_text": "exact existing snippet from the file",\n'
-                        f'      "new_text": "replacement snippet"\n'
-                        f'    }}\n'
-                        f'  ]\n'
-                        f"}}"
-                    )
+                        recovery_prompt = (
+                            f"{SYSTEM_INSTRUCTION}\n"
+                            f"Validation failure category: {diag.edit_validation_category or diag.json_error_category or diag.failure_category}\n"
+                            f"Correction required: {category_msg}\n\n"
+                            f"Finding to fix:\n"
+                            f"- Title: {finding.title[:150]}\n"
+                            f"- File: {finding.file_path}\n"
+                            f"- Evidence: {bounded_evidence[:150]}\n\n"
+                            f"Original file content of '{finding.file_path}':\n```\n{reduced_content}\n```\n\n"
+                            f"CRITICAL INSTRUCTIONS:\n"
+                            f"1. Target file MUST be '{finding.file_path}'.\n"
+                            f"2. Use operation 'replace_text'.\n"
+                            f"3. Every 'old_text' MUST match the file contents above EXACTLY ONCE.\n"
+                            f"4. Make ONLY the minimal change required.\n"
+                            f"5. Do NOT propose overlapping edits.\n"
+                            f"6. Return ONLY a single raw JSON object matching the contract:\n\n"
+                            f"{{\n"
+                            f'  "operation": "replace_text",\n'
+                            f'  "target_path": "{finding.file_path}",\n'
+                            f'  "explanation": "concise explanation of why this fix resolves the finding",\n'
+                            f'  "edits": [\n'
+                            f'    {{\n'
+                            f'      "old_text": "exact existing snippet from the file",\n'
+                            f'      "new_text": "replacement snippet"\n'
+                            f'    }}\n'
+                            f'  ]\n'
+                            f"}}"
+                        )
 
                     logger.info(
                         "Hosted Gemma patch recoverable response (%s / %s). Attempting bounded recovery (1/1) with %.2fs remaining budget...",
@@ -1856,7 +2071,9 @@ class GemmaApiProvider(BaseAIProvider):
                             rec_diag.recovery_outcome = "failed"
                         elif rec_status in {
                             "missing_edits", "malformed_edit", "empty_old_text",
-                            "missing_old_text_match", "ambiguous_old_text", "overlapping_edits"
+                            "missing_old_text_match", "ambiguous_old_text", "overlapping_edits",
+                            "empty_content", "missing_content", "invalid_operation",
+                            "file_not_found_for_edit", "existing_file_overwrite_prohibited"
                         }:
                             rec_diag.failure_category = "malformed_output"
                             rec_diag.recovery_outcome = "failed"
@@ -1868,6 +2085,7 @@ class GemmaApiProvider(BaseAIProvider):
                             rec_diag.recovery_outcome = "failed"
                     else:
                         rec_diag.recovery_outcome = "failed"
+
 
                     if data is None:
                         log_sanitized_diagnostics(

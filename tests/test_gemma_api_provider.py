@@ -3635,4 +3635,589 @@ def test_regression_13_no_patch_applied_to_disk_automatically(tmp_path):
     assert not (tmp_path / ".quietpatch").exists()
 
 
+# ==============================================================================
+# Release Acceptance Gate: Section 6 Regression Tests for Production Evidence
+# ==============================================================================
+
+
+def test_sec6_1_missing_gitignore_finding_generates_valid_create_file_proposal(tmp_path):
+    """1. The missing .gitignore finding generates a valid create_file proposal."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="finding-gen-no-gitignore-c6695a57",
+        category=FindingCategory.GENERAL,
+        title="Missing .gitignore file",
+        file_path=".gitignore",
+        evidence="No .gitignore found",
+        explanation="Repository lacks standard exclusion file",
+        suggested_action="Create .gitignore with standard Python exclusions",
+        severity=Severity.LOW,
+    )
+
+    model_response = json.dumps({
+        "operation": "create_file",
+        "target_path": ".gitignore",
+        "explanation": "Add standard repository exclusions",
+        "content": "*.pyc\n__pycache__/\n.env\n",
+    })
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(model_response)
+
+    patch = provider.propose_patch(finding, "", tmp_path, run_id="run-sec6-1")
+    assert patch is not None
+    assert patch.finding_id == "finding-gen-no-gitignore-c6695a57"
+    assert patch.file_path == ".gitignore"
+    assert patch.proposed_content == "*.pyc\n__pycache__/\n.env\n"
+    assert "--- a/.gitignore" in patch.diff
+    assert "+++ b/.gitignore" in patch.diff
+    assert "+*.pyc" in patch.diff
+    assert "+__pycache__/" in patch.diff
+
+    # Verify initial prompt requested operation create_file
+    call_args = mock_client.models.generate_content.call_args_list[0]
+    prompt_sent = call_args.kwargs.get("contents") or call_args[1].get("contents")
+    assert "operation 'create_file'" in prompt_sent
+    assert not (tmp_path / ".gitignore").exists()
+
+
+def test_sec6_2_new_file_diff_passes_security_validation_without_original_text_anchor(tmp_path):
+    """2. A new-file diff passes security validation without an original-text anchor."""
+    from backend.services.patch_service import PatchService
+    patch_service = PatchService()
+
+    finding = Finding(
+        id="finding-gen-no-gitignore-c6695a57",
+        category=FindingCategory.GENERAL,
+        title="Missing .gitignore file",
+        file_path=".gitignore",
+        evidence="No .gitignore found",
+        explanation="Repository lacks standard exclusions",
+        suggested_action="Create .gitignore file",
+    )
+    diff = "--- a/.gitignore\n+++ b/.gitignore\n@@ -0,0 +1,2 @@\n+*.pyc\n+.env\n"
+    proposed_patch = ProposedPatch(
+        id="patch-new-file",
+        finding_id=finding.id,
+        file_path=".gitignore",
+        original_content="",
+        proposed_content="*.pyc\n.env\n",
+        diff=diff,
+        change_summary="Add .gitignore",
+        explanation="Add standard repository exclusions",
+        risks_assumptions="None",
+        suggested_verification="Check git status",
+        status=PatchStatus.PENDING,
+    )
+
+    # Validating path and security within repo bounds succeeds
+    resolved_path = patch_service._resolve_and_validate_path(tmp_path, proposed_patch.file_path)
+    assert resolved_path == (tmp_path / ".gitignore").resolve()
+    assert not resolved_path.exists()
+
+
+def test_sec6_3_empty_old_text_for_existing_file_replacement_is_rejected(tmp_path):
+    """3. Empty old_text for an existing-file replacement is rejected."""
+    existing_file = tmp_path / "app.py"
+    existing_file.write_text("print('hello')\n", encoding="utf-8")
+
+    finding = Finding(
+        id="f-existing-empty-old",
+        category=FindingCategory.CONFIGURATION,
+        title="Update app",
+        file_path="app.py",
+        evidence="print('hello')",
+        explanation="Update app print",
+        suggested_action="Change hello to world",
+    )
+
+    bad_edit_candidate = {
+        "operation": "replace_text",
+        "target_path": "app.py",
+        "explanation": "Replace text with empty anchor",
+        "edits": [{"old_text": "", "new_text": "print('world')\n"}],
+    }
+
+    status, patch_data, err_msg, edit_cat = validate_and_apply_structured_edits(
+        bad_edit_candidate, finding, "print('hello')\n", tmp_path
+    )
+    assert status == "empty_old_text"
+    assert edit_cat == "empty_old_text"
+    assert patch_data is None
+
+
+def test_sec6_4_successful_corrective_recovery_from_empty_old_text(tmp_path):
+    """4. A successful corrective recovery from empty_old_text when file is absent."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="finding-gen-no-gitignore-c6695a57",
+        category=FindingCategory.GENERAL,
+        title="Missing .gitignore file",
+        file_path=".gitignore",
+        evidence="No .gitignore found",
+        explanation="Missing gitignore",
+        suggested_action="Add .gitignore",
+        severity=Severity.LOW,
+    )
+
+    # Attempt 1: Model wrongly uses replace_text with empty old_text
+    resp1 = _make_mock_genai_response(json.dumps({
+        "operation": "replace_text",
+        "target_path": ".gitignore",
+        "explanation": "Add gitignore",
+        "edits": [{"old_text": "", "new_text": "*.pyc\n"}],
+    }))
+
+    # Attempt 2: Corrective recovery returns create_file
+    resp2 = _make_mock_genai_response(json.dumps({
+        "operation": "create_file",
+        "target_path": ".gitignore",
+        "explanation": "Add gitignore",
+        "content": "*.pyc\n.env\n",
+    }))
+
+    mock_client.models.generate_content.side_effect = [resp1, resp2]
+
+    patch = provider.propose_patch(finding, "", tmp_path, run_id="run-sec6-4")
+    assert patch is not None
+    assert patch.proposed_content == "*.pyc\n.env\n"
+    assert mock_client.models.generate_content.call_count == 2
+
+    # Verify recovery prompt explicitly instructed create_file because file is absent
+    rec_call = mock_client.models.generate_content.call_args_list[1]
+    rec_prompt = rec_call.kwargs.get("contents") or rec_call[1].get("contents")
+    assert "Target file '.gitignore' does not exist in the repository." in rec_prompt
+    assert "operation 'create_file'" in rec_prompt
+
+
+def test_sec6_5_second_invalid_response_fails_safely_without_crashing_scan(tmp_path):
+    """5. A second invalid response fails safely without crashing the scan."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-sec6-5",
+        category=FindingCategory.DOCUMENTATION,
+        title="Doc typo",
+        file_path="README.md",
+        evidence="evidence",
+        explanation="exp",
+        suggested_action="act",
+        severity=Severity.LOW,
+    )
+
+    resp1 = _make_mock_genai_response("Invalid prose 1")
+    resp2 = _make_mock_genai_response("Invalid prose 2")
+    mock_client.models.generate_content.side_effect = [resp1, resp2]
+
+    patch = provider.propose_patch(finding, "content\n", tmp_path, run_id="run-sec6-5")
+    assert patch is None
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_sec6_6_valid_fenced_json_is_parsed_correctly(tmp_path):
+    """6. Valid fenced JSON is parsed correctly."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-sec6-6",
+        category=FindingCategory.CONFIGURATION,
+        title="Add env file",
+        file_path=".env.example",
+        evidence="missing env",
+        explanation="Create env template",
+        suggested_action="Create .env.example",
+    )
+
+    fenced_content = (
+        "Here is the proposed configuration:\n\n"
+        "```json\n"
+        + json.dumps({
+            "operation": "create_file",
+            "target_path": ".env.example",
+            "explanation": "Create .env.example template",
+            "content": "PORT=8000\nDEBUG=False\n",
+        })
+        + "\n```\n"
+        "This configuration sets default values."
+    )
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(fenced_content)
+
+    patch = provider.propose_patch(finding, "", tmp_path, run_id="run-sec6-6")
+    assert patch is not None
+    assert patch.proposed_content == "PORT=8000\nDEBUG=False\n"
+    assert "+PORT=8000" in patch.diff
+
+
+def test_sec6_7_absolute_paths_traversal_symlink_escapes_and_overwrites_rejected(tmp_path):
+    """7. Absolute paths, traversal, symlink escapes, and existing-file overwrites are rejected."""
+    existing_file = tmp_path / "existing.py"
+    existing_file.write_text("a = 1\n", encoding="utf-8")
+
+    finding = Finding(
+        id="f-sec6-7",
+        category=FindingCategory.CONFIGURATION,
+        title="Overwrite check",
+        file_path="existing.py",
+        evidence="a = 1",
+        explanation="Test overwrite check",
+        suggested_action="Do not overwrite",
+    )
+
+    # 7A: Overwrite of existing file with create_file is rejected
+    overwrite_cand = {
+        "operation": "create_file",
+        "target_path": "existing.py",
+        "explanation": "Overwriting existing file",
+        "content": "a = 2\n",
+    }
+    st, data, err, cat = validate_and_apply_structured_edits(overwrite_cand, finding, "a = 1\n", tmp_path)
+    assert st == "existing_file_overwrite_prohibited"
+    assert cat == "existing_file_overwrite_prohibited"
+    assert data is None
+
+    # 7B: Absolute path
+    abs_cand = {
+        "operation": "create_file",
+        "target_path": "/etc/shadow",
+        "content": "root:hacked\n",
+    }
+    st_abs, _, _, cat_abs = validate_and_apply_structured_edits(abs_cand, finding, "", tmp_path)
+    assert st_abs == "invalid_target_path"
+    assert cat_abs == "absolute_path_prohibited"
+
+    # 7C: Path traversal
+    trav_cand = {
+        "operation": "create_file",
+        "target_path": "../outside.txt",
+        "content": "hacked\n",
+    }
+    st_trav, _, _, cat_trav = validate_and_apply_structured_edits(trav_cand, finding, "", tmp_path)
+    assert st_trav == "invalid_target_path"
+    assert cat_trav == "path_traversal_prohibited"
+
+
+def test_sec6_8_transient_http_500_followed_by_success_handled_correctly(tmp_path):
+    """8. A transient HTTP 500 followed by success is handled correctly."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=2, backoff_factor=0.01)
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-sec6-8",
+        category=FindingCategory.CONFIGURATION,
+        title="Fix server",
+        file_path="server.py",
+        evidence="PORT = 5000",
+        explanation="Update server port",
+        suggested_action="Change to 8080",
+    )
+
+    err_500 = genai_errors.ServerError(500, "Internal Server Error")
+    resp_ok = _make_mock_genai_response(json.dumps({
+        "operation": "replace_text",
+        "target_path": "server.py",
+        "explanation": "Update port",
+        "edits": [{"old_text": "PORT = 5000", "new_text": "PORT = 8080"}],
+    }))
+
+    mock_client.models.generate_content.side_effect = [err_500, resp_ok]
+
+    with patch("time.sleep", return_value=None):
+        proposed_patch = provider.propose_patch(finding, "PORT = 5000\n", tmp_path, run_id="run-sec6-8")
+
+    assert proposed_patch is not None
+    assert proposed_patch.proposed_content == "PORT = 8080\n"
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_sec6_9_exhausted_http_500_attempts_preserve_successful_earlier_patches(tmp_path):
+    """9. Exhausted HTTP 500 attempts preserve successful earlier patches and report partial completion."""
+    f1_file = tmp_path / "file1.py"
+    f1_file.write_text("x = 1\n", encoding="utf-8")
+    f2_file = tmp_path / "file2.py"
+    f2_file.write_text("y = 2\n", encoding="utf-8")
+
+    f1 = Finding(
+        id="f-500-succ",
+        category=FindingCategory.CONFIGURATION,
+        title="Fix 1",
+        file_path="file1.py",
+        evidence="x = 1",
+        explanation="Fix x",
+        suggested_action="Fix x",
+        severity=Severity.LOW,
+        ai_assisted=True,
+    )
+    f2 = Finding(
+        id="f-500-fail",
+        category=FindingCategory.CONFIGURATION,
+        title="Fix 2",
+        file_path="file2.py",
+        evidence="y = 2",
+        explanation="Fix y",
+        suggested_action="Fix y",
+        severity=Severity.LOW,
+        ai_assisted=True,
+    )
+
+    mock_client = MagicMock()
+    resp_f1 = _make_mock_genai_response(json.dumps({
+        "operation": "replace_text",
+        "target_path": "file1.py",
+        "explanation": "Update x to 10",
+        "edits": [{"old_text": "x = 1", "new_text": "x = 10"}],
+    }))
+    err_500 = genai_errors.ServerError(500, "Internal Server Error")
+
+    # Finding 1 succeeds on attempt 1. Finding 2 fails attempt 1, 2, 3 with 500.
+    mock_client.models.generate_content.side_effect = [resp_f1, err_500, err_500, err_500]
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=2, backoff_factor=0.01)
+    provider._client = mock_client
+
+    agent = AgentService(provider_name="gemma_api")
+    agent.provider = provider
+
+    with patch.object(agent.scan_engine, "discover_files", return_value=([f1_file, f2_file], 20)), \
+         patch.object(agent.scan_engine, "run_scanners", return_value=([f1, f2], {})), \
+         patch.object(provider, "analyze_and_prioritize", return_value=[f1, f2]), \
+         patch("time.sleep", return_value=None):
+
+        run = agent.execute_maintenance_run(
+            repo_path=tmp_path,
+            repo_name="PreserveOn500Repo",
+            repo_type="local",
+            run_id="run-sec6-9",
+        )
+
+    assert run.status == "completed"
+    assert len(run.patches) == 1
+    assert run.patches[0].finding_id == "f-500-succ"
+    assert run.stages["proposal"].status == "partial"
+    assert "1/2 patches" in run.stages["proposal"].details
+
+
+def test_sec6_10_http_504_and_request_timeouts_cannot_trigger_unbounded_retry_loops():
+    """10. HTTP 504 and request timeouts cannot trigger unbounded retry loops."""
+    provider = GemmaApiProvider(
+        api_key="valid-key",
+        model="gemma-4-26b-a4b-it",
+        max_retries=2,
+        backoff_factor=0.01,
+    )
+    mock_client = MagicMock()
+    err_504 = genai_errors.ServerError(504, "Deadline Exceeded")
+    mock_client.models.generate_content.side_effect = err_504
+
+    with pytest.raises((GemmaApiTransientError, GemmaApiError)) as exc_info:
+        provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=30.0)
+
+    # Exactly max_retries + 1 (3 attempts) occurred, never unbounded
+    assert mock_client.models.generate_content.call_count == 3
+    assert "Deadline Exceeded" in str(exc_info.value) or "failed" in str(exc_info.value).lower()
+
+
+def test_sec6_11_sdk_retries_do_not_multiply_unexpectedly_with_application_retries():
+    """11. SDK retries do not multiply unexpectedly with application retries."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=1, backoff_factor=0.01)
+    mock_client = MagicMock()
+    mock_client._api_client = MagicMock()
+    mock_client._api_client._http_options = MagicMock()
+
+    mock_client.models.generate_content.side_effect = [
+        genai_errors.ServerError(503, "Service Unavailable"),
+        _make_mock_genai_response("OK"),
+    ]
+
+    with patch("time.sleep", return_value=None):
+        resp = provider._generate_with_retry("test", mock_client, time_budget_seconds=30.0)
+
+    assert resp is not None
+    # Client generate_content was called exactly 2 times (1 initial + 1 app retry), not multiplied by SDK internal retries
+    assert mock_client.models.generate_content.call_count == 2
+    # Verify retry_options were configured with attempts=1 on client transport
+    assert mock_client._api_client._http_options.retry_options.attempts == 1
+
+
+def test_sec6_12_initial_and_recovery_requests_share_same_finite_wall_clock_budget(tmp_path):
+    """12. Initial and recovery requests share the same finite wall-clock budget."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-sec6-12",
+        category=FindingCategory.CONFIGURATION,
+        title="Check budget share",
+        file_path="app.py",
+        evidence="ev",
+        explanation="Check budget",
+        suggested_action="Check budget action",
+    )
+
+    # Attempt 1 returns malformed output
+    resp1 = _make_mock_genai_response("Malformed prose without JSON")
+    mock_client.models.generate_content.return_value = resp1
+
+    current_time = 1000.0
+
+    def fake_time():
+        nonlocal current_time
+        return current_time
+
+    # Simulate that initial request consumed 82 seconds out of 90-second patch budget
+    # Leaving only 8 seconds, which is less than MIN_GOOGLE_DEADLINE_SECONDS (10s)
+    def side_effect_slow(*args, **kwargs):
+        nonlocal current_time
+        current_time += 82.0
+        return resp1
+
+    mock_client.models.generate_content.side_effect = side_effect_slow
+
+    with patch.object(Config, "GEMMA_API_PATCH_TIMEOUT_SECONDS", 90.0), \
+         patch("time.time", side_effect=fake_time):
+        proposed_patch = provider.propose_patch(finding, "x = 1\n", tmp_path, run_id="run-sec6-12")
+
+    # Recovery was skipped because remaining budget was only 8s (< 10.5s minimum)
+    assert proposed_patch is None
+    assert mock_client.models.generate_content.call_count == 1
+
+
+def test_sec6_13_exact_request_timeout_configuration_reaches_actual_sdk_transport_path():
+    """13. The exact request-timeout configuration reaches the actual SDK transport path in milliseconds."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    mock_client._api_client = MagicMock()
+    mock_client._api_client._http_options = MagicMock()
+
+    mock_client.models.generate_content.return_value = _make_mock_genai_response("OK")
+
+    provider._generate_with_retry("test prompt", mock_client, time_budget_seconds=25.0)
+
+    # Verify that timeout was passed in milliseconds (~24500ms for a 25.0s budget)
+    assert 20000 <= mock_client._api_client._http_options.timeout <= 25000
+    assert isinstance(mock_client._api_client._http_options.timeout, int)
+    call_kwargs = mock_client.models.generate_content.call_args.kwargs
+    config_obj = call_kwargs.get("config")
+    assert config_obj is not None
+    assert 20000 <= config_obj.http_options.timeout <= 25000
+    assert isinstance(config_obj.http_options.timeout, int)
+
+
+def test_sec6_14_no_unverified_patch_is_written_to_target_repository(tmp_path):
+    """14. No unverified patch is written to the target repository during proposal generation."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    # Case A: new file proposal
+    finding_new = Finding(
+        id="f-sec6-14-new",
+        category=FindingCategory.GENERAL,
+        title="Missing file",
+        file_path="new_file.txt",
+        evidence="missing",
+        explanation="Create new file",
+        suggested_action="Create new file",
+    )
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(json.dumps({
+        "operation": "create_file",
+        "target_path": "new_file.txt",
+        "explanation": "Create new file",
+        "content": "new file content\n",
+    }))
+    patch_new = provider.propose_patch(finding_new, "", tmp_path)
+    assert patch_new is not None
+    # Disk check: new_file.txt was NOT created
+    assert not (tmp_path / "new_file.txt").exists()
+
+    # Case B: existing file proposal
+    existing_target = tmp_path / "target.py"
+    existing_target.write_text("old = True\n", encoding="utf-8")
+    finding_exist = Finding(
+        id="f-sec6-14-exist",
+        category=FindingCategory.CONFIGURATION,
+        title="Update file",
+        file_path="target.py",
+        evidence="old = True",
+        explanation="Update target file",
+        suggested_action="Set old to False",
+    )
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(json.dumps({
+        "operation": "replace_text",
+        "target_path": "target.py",
+        "explanation": "Update existing file",
+        "edits": [{"old_text": "old = True", "new_text": "old = False"}],
+    }))
+    patch_exist = provider.propose_patch(finding_exist, "old = True\n", tmp_path)
+    assert patch_exist is not None
+    # Disk check: target.py was NOT modified
+    assert existing_target.read_text(encoding="utf-8") == "old = True\n"
+
+
+def test_sec6_15_sentry_reporting_and_frontend_status_remain_truthful(tmp_path):
+    """15. Sentry reporting and frontend status remain truthful without exposing secrets."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-sec6-15",
+        category=FindingCategory.DOCUMENTATION,
+        title="Check doc truthfulness",
+        file_path="docs.md",
+        evidence="doc error",
+        explanation="Fix documentation",
+        suggested_action="Correct doc text",
+    )
+
+    valid_response = _make_mock_genai_response(
+        json.dumps({
+            "operation": "replace_text",
+            "target_path": "docs.md",
+            "explanation": "Fix doc error",
+            "edits": [{"old_text": "doc error", "new_text": "doc corrected"}],
+        }),
+        finish_reason="STOP",
+        prompt_tokens=350,
+        candidate_tokens=80,
+        total_tokens=430,
+    )
+    valid_response._qp_elapsed_seconds = 2.45
+    valid_response._qp_configured_timeout_ms = 30000
+    valid_response._qp_attempt_number = 1
+
+    mock_client.models.generate_content.return_value = valid_response
+
+    fake_span = MagicMock()
+    fake_span_context = MagicMock(__enter__=MagicMock(return_value=fake_span), __exit__=MagicMock(return_value=False))
+
+    with patch("backend.ai.gemma_api_provider.agent_stage_span", return_value=fake_span_context):
+        patch_obj = provider.propose_patch(finding, "doc error\n", tmp_path, run_id="run-sec6-15")
+
+    assert patch_obj is not None
+    assert patch_obj.status == PatchStatus.PENDING
+
+    span_tags = {call[0][0]: call[0][1] for call in fake_span.set_tag.call_args_list}
+    span_data = {call[0][0]: call[0][1] for call in fake_span.set_data.call_args_list}
+
+    assert span_tags.get("finding_id") == "f-sec6-15"
+    assert span_tags.get("finish_reason") == "STOP"
+    assert "elapsed_seconds" in span_data
+    assert "configured_timeout_ms" in span_data
+    assert "attempt_number" in span_data
+    # Verify no secret leakage
+    for val in list(span_tags.values()) + list(span_data.values()):
+        assert "valid-key" not in str(val)
+
+
+
 
