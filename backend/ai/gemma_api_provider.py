@@ -6,7 +6,7 @@ import random
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.ai.provider_base import BaseAIProvider
 from backend.config import Config
@@ -119,8 +119,10 @@ class ResponseDiagnostics:
             "empty_output", "thought_only_exhaustion", "no_response",
         }:
             return "empty_response"
-        if self.failure_category in {"malformed_output", "malformed_json"}:
+        if self.failure_category in {"malformed_output", "malformed_json", "no_patch_content", "invalid_diff"}:
             return "malformed_output"
+        if self.failure_category in {"invalid_target_path", "no_op_patch"}:
+            return self.failure_category
         if self.failure_category in {"transient_api_error", "permanent_client_error", "success"}:
             return self.failure_category
         return self.failure_category or "unknown"
@@ -130,7 +132,7 @@ class ResponseDiagnostics:
         """Determines whether a response failure can be recovered with a controlled single retry."""
         if not self.has_response:
             return False
-        if self.failure_category in {"safety_blocked", "permanent_client_error"}:
+        if self.failure_category in {"safety_blocked", "permanent_client_error", "invalid_target_path", "no_op_patch"}:
             return False
         return self.failure_category in {
             "output_truncated",
@@ -142,6 +144,8 @@ class ResponseDiagnostics:
             "absent_content",
             "malformed_output",
             "malformed_json",
+            "no_patch_content",
+            "invalid_diff",
         }
 
     def sanitized_summary(self) -> str:
@@ -191,7 +195,11 @@ def classify_patch_error(exc: Exception) -> str:
         return "time_budget_exhausted"
     if "output_token_truncated" in msg or "output_truncated" in msg or "max_tokens" in msg:
         return "output_token_truncated"
-    if isinstance(exc, json.JSONDecodeError) or "malformed" in msg or "jsondecodeerror" in exc_type:
+    if "invalid_target_path" in msg or "target path rejected" in msg or "unexpected_target_file" in msg or "path_traversal" in msg:
+        return "invalid_target_path"
+    if "no_op_patch" in msg or "identical to original" in msg or "empty unified diff" in msg:
+        return "no_op_patch"
+    if isinstance(exc, json.JSONDecodeError) or "malformed" in msg or "jsondecodeerror" in exc_type or "invalid_diff" in msg:
         return "malformed_output"
     if isinstance(exc, GemmaApiTransientError):
         return "transient_api_error"
@@ -370,22 +378,391 @@ def clean_json_text(text: Optional[str]) -> str:
 
     t = text.strip()
 
-    # Strip direct ```json ... ``` code fences
-    if t.startswith("```"):
-        t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
-        t = re.sub(r"\s*```$", "", t)
-    else:
-        # Search for embedded markdown code blocks
-        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", t, flags=re.IGNORECASE)
-        if fence_match:
-            t = fence_match.group(1).strip()
-        else:
-            # Fallback: search for top-level JSON array [...] or object {...}
-            bracket_match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", t)
-            if bracket_match:
-                t = bracket_match.group(1).strip()
+    # 1. If entire text directly parses as JSON, return stripped
+    try:
+        json.loads(t, strict=False)
+        return t
+    except Exception:
+        pass
 
-    return t.strip()
+    # 2. If wrapped in outer code fence ```json ... ```, strip outer fence
+    if t.startswith("```"):
+        last_fence = t.rfind("```")
+        if last_fence > 2:
+            inner = t[:last_fence]
+            inner = re.sub(r"^```(?:json)?\s*", "", inner, flags=re.IGNORECASE).strip()
+            try:
+                json.loads(inner, strict=False)
+                return inner
+            except Exception:
+                pass
+
+    # 3. Search for outermost JSON structure: { ... } or [ ... ]
+    first_obj = t.find("{")
+    last_obj = t.rfind("}")
+    first_arr = t.find("[")
+    last_arr = t.rfind("]")
+
+    cand_obj = t[first_obj:last_obj + 1].strip() if (first_obj != -1 and last_obj > first_obj) else None
+    cand_arr = t[first_arr:last_arr + 1].strip() if (first_arr != -1 and last_arr > first_arr) else None
+
+    # Try candidate matching the earliest starting bracket first
+    candidates = (
+        [cand_obj, cand_arr]
+        if (first_obj != -1 and (first_arr == -1 or first_obj < first_arr))
+        else [cand_arr, cand_obj]
+    )
+    for c in candidates:
+        if c:
+            try:
+                json.loads(c, strict=False)
+                return c
+            except Exception:
+                pass
+
+    if cand_obj and (first_arr == -1 or first_obj < first_arr):
+        return cand_obj
+    elif cand_arr:
+        return cand_arr
+    elif cand_obj:
+        return cand_obj
+
+    # 4. Fallback: regex stripping of outer code fence
+    cand = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    cand = re.sub(r"\s*```$", "", cand)
+    return cand.strip()
+
+
+def apply_unified_diff(original_text: str, diff_text: str) -> Optional[str]:
+    """Applies a unified diff to original_text.
+
+    Returns the updated full content string if all hunks match and apply cleanly;
+    returns None if the diff is malformed or hunk context does not match.
+    """
+    if not diff_text or not isinstance(diff_text, str):
+        return None
+
+    orig_lines = original_text.splitlines(keepends=True)
+    diff_lines = diff_text.splitlines(keepends=True)
+
+    # 1. Parse hunks from diff
+    hunk_pattern = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+    hunks = []
+    current_hunk = None
+
+    for raw_line in diff_lines:
+        line = raw_line.rstrip("\r\n")
+        m = hunk_pattern.match(line)
+        if m:
+            if current_hunk:
+                hunks.append(current_hunk)
+            old_start = int(m.group(1))
+            old_count = int(m.group(2)) if m.group(2) is not None else 1
+            current_hunk = {
+                "old_start": old_start,
+                "old_count": old_count,
+                "lines": [],
+            }
+        elif current_hunk is not None:
+            if raw_line.startswith(("+", "-", " ", "\\")):
+                current_hunk["lines"].append(raw_line)
+
+    if current_hunk:
+        hunks.append(current_hunk)
+
+    if not hunks:
+        return None
+
+    # 2. Apply hunks sequentially
+    cur_lines = list(orig_lines)
+    offset = 0
+
+    for hunk in hunks:
+        old_lines = [l[1:] for l in hunk["lines"] if l.startswith((" ", "-"))]
+        new_lines = []
+        for l in hunk["lines"]:
+            if l.startswith((" ", "+")):
+                c = l[1:]
+                if orig_lines and orig_lines[0].endswith("\n") and not c.endswith("\n"):
+                    c += "\n"
+                new_lines.append(c)
+
+        hint_start = max(0, hunk["old_start"] - 1 + offset) if hunk["old_start"] > 0 else 0
+        found_pos = -1
+
+        if old_lines:
+            # Check hint_start first
+            if hint_start + len(old_lines) <= len(cur_lines):
+                if all(cur_lines[hint_start + i].rstrip("\r\n") == old_lines[i].rstrip("\r\n") for i in range(len(old_lines))):
+                    found_pos = hint_start
+
+            # Search outwards if line numbers shifted
+            if found_pos == -1:
+                max_delta = max(hint_start, len(cur_lines) - hint_start)
+                for d in range(1, max_delta + 1):
+                    pos1 = hint_start - d
+                    if 0 <= pos1 and pos1 + len(old_lines) <= len(cur_lines):
+                        if all(cur_lines[pos1 + i].rstrip("\r\n") == old_lines[i].rstrip("\r\n") for i in range(len(old_lines))):
+                            found_pos = pos1
+                            break
+                    pos2 = hint_start + d
+                    if pos2 + len(old_lines) <= len(cur_lines):
+                        if all(cur_lines[pos2 + i].rstrip("\r\n") == old_lines[i].rstrip("\r\n") for i in range(len(old_lines))):
+                            found_pos = pos2
+                            break
+
+            if found_pos == -1:
+                return None
+
+            cur_lines[found_pos:found_pos + len(old_lines)] = new_lines
+            offset += (len(new_lines) - len(old_lines))
+        else:
+            cur_lines[hint_start:hint_start] = new_lines
+            offset += len(new_lines)
+
+    return "".join(cur_lines)
+
+
+def extract_unified_diff(text: str) -> str:
+    """Extracts a unified diff from raw model text or fenced blocks.
+
+    Rejects unrelated prose and requires unambiguous diff / hunk structure.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+
+    t = text.strip()
+
+    # 1. If wrapped in outermost markdown fence, strip it safely using rfind
+    if t.startswith("```"):
+        first_newline = t.find("\n")
+        last_fence = t.rfind("```")
+        if first_newline != -1 and last_fence > first_newline:
+            t = t[first_newline + 1:last_fence].strip()
+
+    # 2. Check if text contains a raw unified diff block
+    lines = t.splitlines()
+    diff_start = -1
+    for idx, line in enumerate(lines):
+        if line.startswith("--- ") or re.match(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", line):
+            diff_start = idx
+            break
+
+    if diff_start >= 0:
+        collected = []
+        for line in lines[diff_start:]:
+            if line.startswith(("--- ", "+++ ", "@@ ", " ", "+", "-", "\\")) or line == "":
+                collected.append(line)
+            elif collected and not line.strip():
+                collected.append(line)
+            else:
+                break
+        result = "\n".join(collected).strip()
+        if "@@" in result:
+            return result
+
+    return ""
+
+
+def extract_diff_target_path(diff_text: str) -> Optional[str]:
+    """Extracts target file path from unified diff header (+++ or --- lines)."""
+    if not diff_text or not isinstance(diff_text, str):
+        return None
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            raw = line[4:].strip()
+            path_part = raw.split("\t")[0].strip()
+            for prefix in ("b/", "a/", "i/", "w/"):
+                if path_part.startswith(prefix):
+                    path_part = path_part[len(prefix):]
+                    break
+            return path_part
+    for line in diff_text.splitlines():
+        if line.startswith("--- ") and not line.startswith("--- /dev/null"):
+            raw = line[4:].strip()
+            path_part = raw.split("\t")[0].strip()
+            for prefix in ("a/", "b/", "i/", "w/"):
+                if path_part.startswith(prefix):
+                    path_part = path_part[len(prefix):]
+                    break
+            return path_part
+    return None
+
+
+def validate_diff_path(
+    target_path: Optional[str],
+    finding_path: str,
+    repo_path: Optional[Path] = None,
+) -> Tuple[bool, str]:
+    """Validates that a diff's target path matches the finding, has no traversal or absolute escapes,
+    and stays within permitted repo root.
+    """
+    if not target_path:
+        return True, "no_path_in_diff"
+
+    # Reject absolute path
+    if Path(target_path).is_absolute() or target_path.startswith("/"):
+        return False, "absolute_path_prohibited"
+
+    clean = target_path.strip().lstrip("/")
+    # Reject path traversal (..)
+    if ".." in Path(clean).parts:
+        return False, "path_traversal_prohibited"
+
+    # Check match with finding.file_path
+    norm_target = str(Path(clean)).lstrip("./")
+    norm_finding = str(Path(finding_path)).lstrip("./")
+    if norm_target != norm_finding and not norm_target.endswith(norm_finding):
+        return False, f"unexpected_target_file: expected '{finding_path}', got '{target_path}'"
+
+    # Verify repository containment if repo_path provided
+    if repo_path:
+        try:
+            full_path = (repo_path / clean).resolve()
+            full_path.relative_to(repo_path.resolve())
+            if full_path.is_symlink():
+                return False, "symlink_prohibited"
+        except Exception:
+            return False, "escapes_repository_root"
+
+    return True, "valid"
+
+
+def extract_patch_candidate(
+    raw_text: Optional[str],
+    finding: Finding,
+    original_content: str,
+    repo_path: Optional[Path] = None,
+) -> Tuple[str, Optional[Dict[str, Any]], str]:
+    """Parses and validates a candidate patch response from model text.
+
+    Supports:
+    1. JSON with 'proposed_content'
+    2. JSON with 'diff' or 'patch'
+    3. Raw or fenced unified diff text
+
+    Returns:
+    (status, data_dict, error_detail)
+    where status is one of:
+    - 'success': data_dict contains proposed_content, diff, change_summary, etc.
+    - 'invalid_json': JSON structure attempted but malformed
+    - 'invalid_diff': diff attempted but malformed or does not apply cleanly
+    - 'invalid_path': path traversal, absolute path, or unexpected target file
+    - 'no_op_patch': proposed changes are identical to original content
+    - 'no_patch_content': text contains no recognizable patch or diff
+    """
+    if not raw_text or not isinstance(raw_text, str) or not raw_text.strip():
+        return "no_patch_content", None, "Empty model response text"
+
+    cleaned_json = clean_json_text(raw_text)
+    candidate_dict = None
+    json_decode_error = None
+
+    if cleaned_json:
+        try:
+            parsed = json.loads(cleaned_json, strict=False)
+            if isinstance(parsed, dict):
+                candidate_dict = parsed
+        except (json.JSONDecodeError, ValueError) as err:
+            json_decode_error = err
+
+    # Case 1: JSON with proposed_content
+    if candidate_dict and isinstance(candidate_dict.get("proposed_content"), str):
+        proposed = candidate_dict["proposed_content"]
+        if proposed.strip() == original_content.strip():
+            return "no_op_patch", None, "Model proposed_content is identical to original"
+
+        diff_lines = list(difflib.unified_diff(
+            original_content.splitlines(keepends=True),
+            proposed.splitlines(keepends=True),
+            fromfile=f"a/{finding.file_path}",
+            tofile=f"b/{finding.file_path}",
+        ))
+        if not diff_lines:
+            return "no_op_patch", None, "Model proposed_content produced an empty unified diff"
+
+        return "success", {
+            "proposed_content": proposed,
+            "diff": "".join(diff_lines),
+            "change_summary": candidate_dict.get("change_summary", f"Fix {finding.title}"),
+            "explanation": candidate_dict.get("explanation", finding.explanation),
+            "risks_assumptions": candidate_dict.get("risks_assumptions", "Low risk minimal change."),
+            "suggested_verification": candidate_dict.get("suggested_verification", "Check syntax and rerun tests."),
+        }, ""
+
+    # Case 2: JSON with 'diff' or 'patch'
+    if candidate_dict and (isinstance(candidate_dict.get("diff"), str) or isinstance(candidate_dict.get("patch"), str)):
+        raw_diff = candidate_dict.get("diff") or candidate_dict.get("patch")
+        target_path = extract_diff_target_path(raw_diff)
+        valid, reason = validate_diff_path(target_path, finding.file_path, repo_path)
+        if not valid:
+            return "invalid_path", None, f"Diff header target path rejected: {reason}"
+
+        applied = apply_unified_diff(original_content, raw_diff)
+        if applied is None:
+            return "invalid_diff", None, "Diff in JSON could not apply cleanly to original content"
+        if applied.strip() == original_content.strip():
+            return "no_op_patch", None, "Diff in JSON produced no changes"
+
+        diff_lines = list(difflib.unified_diff(
+            original_content.splitlines(keepends=True),
+            applied.splitlines(keepends=True),
+            fromfile=f"a/{finding.file_path}",
+            tofile=f"b/{finding.file_path}",
+        ))
+        return "success", {
+            "proposed_content": applied,
+            "diff": "".join(diff_lines),
+            "change_summary": candidate_dict.get("change_summary", f"Fix {finding.title}"),
+            "explanation": candidate_dict.get("explanation", finding.explanation),
+            "risks_assumptions": candidate_dict.get("risks_assumptions", "Low risk minimal change."),
+            "suggested_verification": candidate_dict.get("suggested_verification", "Check syntax and rerun tests."),
+        }, ""
+
+    # Case 3: Raw or fenced unified diff in raw_text
+    cand_diff = extract_unified_diff(raw_text)
+    if cand_diff:
+        target_path = extract_diff_target_path(cand_diff)
+        valid, reason = validate_diff_path(target_path, finding.file_path, repo_path)
+        if not valid:
+            return "invalid_path", None, f"Diff header target path rejected: {reason}"
+
+        applied = apply_unified_diff(original_content, cand_diff)
+        if applied is not None:
+            if applied.strip() == original_content.strip():
+                return "no_op_patch", None, "Unified diff produced no changes"
+
+            diff_lines = list(difflib.unified_diff(
+                original_content.splitlines(keepends=True),
+                applied.splitlines(keepends=True),
+                fromfile=f"a/{finding.file_path}",
+                tofile=f"b/{finding.file_path}",
+            ))
+            return "success", {
+                "proposed_content": applied,
+                "diff": "".join(diff_lines),
+                "change_summary": f"Fix {finding.title}",
+                "explanation": finding.explanation or "Applied minimal fix via unified diff.",
+                "risks_assumptions": "Low risk minimal change.",
+                "suggested_verification": "Check syntax and rerun tests.",
+            }, ""
+        else:
+            return "invalid_diff", None, "Unified diff failed hunk matching against original content"
+
+    # Case 4: Neither parsed cleanly
+    has_json_markers = (
+        '{"' in raw_text
+        or "```json" in raw_text
+        or (candidate_dict is not None and not candidate_dict.get("proposed_content") and not candidate_dict.get("diff") and not candidate_dict.get("patch"))
+        or (cleaned_json.startswith("{") and "}" in cleaned_json)
+    )
+    if has_json_markers:
+        return "invalid_json", None, f"Malformed or incomplete JSON: {json_decode_error or 'invalid schema'}"
+
+    if "@@" in raw_text or "--- " in raw_text:
+        return "invalid_diff", None, "Malformed unified diff syntax"
+
+    return "no_patch_content", None, "Response contained conversational text but no reviewable patch or diff"
 
 
 def log_sanitized_diagnostics(
@@ -1048,21 +1425,19 @@ class GemmaApiProvider(BaseAIProvider):
                 diag = extract_response_diagnostics(response, max_expected_tokens=initial_max_tokens)
 
                 data = None
+                candidate_status = "no_patch_content"
+                parse_err = ""
+
                 if diag.extracted_text:
-                    cleaned_json = clean_json_text(diag.extracted_text)
-                    if cleaned_json:
-                        try:
-                            candidate_dict = json.loads(cleaned_json)
-                            if isinstance(candidate_dict, dict) and isinstance(candidate_dict.get("proposed_content"), str):
-                                data = candidate_dict
-                                diag.failure_category = "success"
-                            else:
-                                diag.failure_category = "malformed_output"
-                        except (json.JSONDecodeError, ValueError):
-                            if diag.finish_reason == "MAX_TOKENS":
-                                diag.failure_category = "output_truncated"
-                            else:
-                                diag.failure_category = "malformed_output"
+                    candidate_status, data, parse_err = extract_patch_candidate(
+                        diag.extracted_text, finding, file_content, repo_path
+                    )
+                    if candidate_status == "success":
+                        diag.failure_category = "success"
+                    elif diag.finish_reason == "MAX_TOKENS":
+                        diag.failure_category = "output_truncated"
+                    elif candidate_status == "invalid_path":
+                        diag.failure_category = "invalid_target_path"
                     else:
                         diag.failure_category = "malformed_output"
 
@@ -1073,10 +1448,11 @@ class GemmaApiProvider(BaseAIProvider):
                     )
                     record_diagnostics_to_span(span, diag, recovery_attempts=0)
 
-                    if not diag.is_recoverable:
+                    if not diag.is_recoverable or candidate_status == "invalid_path":
                         span.set_data("recovery_attempt_count", 0)
+                        span.set_data("rejection_reason", parse_err)
                         raise GemmaApiResponseError(
-                            f"Hosted Gemma patch response non-recoverable ({diag.failure_category}): {diag.sanitized_summary()}"
+                            f"Hosted Gemma patch response non-recoverable ({diag.failure_category}): {diag.sanitized_summary()} - {parse_err}"
                         )
 
                     # Controlled bounded recovery attempt (at most 1) sharing the remaining patch budget
@@ -1097,8 +1473,9 @@ class GemmaApiProvider(BaseAIProvider):
 
                     recovery_attempts = 1
                     recovery_max_tokens = Config.GEMMA_API_PATCH_RECOVERY_MAX_TOKENS
+                    reduced_content = self._bound_file_content(file_content, finding, max_chars=1400)
+
                     if diag.failure_category in {"output_truncated", "output_token_truncated"}:
-                        reduced_content = self._bound_file_content(file_content, finding, max_chars=1200)
                         recovery_prompt = (
                             f"{SYSTEM_INSTRUCTION}\n"
                             f"The previous patch generation was truncated due to token budget limits.\n"
@@ -1119,14 +1496,48 @@ class GemmaApiProvider(BaseAIProvider):
                             f'  "suggested_verification": "1 concise sentence on how to verify the fix"\n'
                             f"}}"
                         )
-                    else:
+                    elif candidate_status == "invalid_diff":
                         recovery_prompt = (
-                            f"{prompt}\n\n"
-                            "CRITICAL: Output ONLY a single valid JSON object adhering strictly to the schema without markdown code blocks or preamble."
+                            f"{SYSTEM_INSTRUCTION}\n"
+                            f"The previous unified diff could not apply cleanly to '{finding.file_path}'. Context lines did not match the file.\n"
+                            f"Provide a corrected, valid unified diff matching the exact lines in '{finding.file_path}' below:\n```\n{reduced_content}\n```\n\n"
+                            f"CRITICAL INSTRUCTIONS:\n"
+                            f"1. Output ONLY a valid unified diff starting with '--- a/{finding.file_path}' and '+++ b/{finding.file_path}'.\n"
+                            f"2. Ensure '-' lines and ' ' context lines match the exact file lines above.\n"
+                            f"3. Do NOT include conversational explanations or intro text."
                         )
+                    elif candidate_status == "no_patch_content":
+                        recovery_prompt = (
+                            f"{SYSTEM_INSTRUCTION}\n"
+                            f"The previous response contained explanatory text but did not provide a reviewable patch or unified diff.\n"
+                            f"Provide ONLY a standard unified diff that resolves finding '{finding.title[:150]}' in file '{finding.file_path}'.\n"
+                            f"Relevant file content:\n```\n{reduced_content}\n```\n\n"
+                            f"CRITICAL INSTRUCTIONS:\n"
+                            f"1. Output ONLY a valid unified diff starting with '--- a/{finding.file_path}' and '+++ b/{finding.file_path}'.\n"
+                            f"2. Include valid '@@' hunk headers.\n"
+                            f"3. Do NOT include conversational explanations or introductory prose."
+                        )
+                    else:  # invalid_json or generic malformed
+                        recovery_prompt = (
+                            f"{SYSTEM_INSTRUCTION}\n"
+                            f"The previous response contained invalid or malformed JSON syntax.\n"
+                            f"Propose the fix for finding '{finding.title[:150]}' in file '{finding.file_path}'.\n"
+                            f"Relevant file content:\n```\n{reduced_content}\n```\n\n"
+                            f"CRITICAL INSTRUCTIONS:\n"
+                            f"1. Make ONLY the minimal change required.\n"
+                            f"2. Output ONLY a single valid raw JSON object matching the schema below without markdown code fences or conversational text:\n"
+                            f"{{\n"
+                            f'  "change_summary": "1 concise sentence describing fix",\n'
+                            f'  "proposed_content": "complete updated file text",\n'
+                            f'  "explanation": "1 concise sentence why this fix resolves the issue",\n'
+                            f'  "risks_assumptions": "1 concise sentence on any minimal risks or assumptions",\n'
+                            f'  "suggested_verification": "1 concise sentence on how to verify the fix"\n'
+                            f"}}"
+                        )
+
                     logger.info(
-                        "Hosted Gemma patch recoverable response (%s). Attempting bounded recovery (1/1) with %.2fs remaining budget...",
-                        diag.failure_category, remaining_for_recovery
+                        "Hosted Gemma patch recoverable response (%s / %s). Attempting bounded recovery (1/1) with %.2fs remaining budget...",
+                        diag.failure_category, candidate_status, remaining_for_recovery
                     )
                     rec_response = self._generate_with_retry(
                         recovery_prompt,
@@ -1139,20 +1550,16 @@ class GemmaApiProvider(BaseAIProvider):
                     rec_diag = extract_response_diagnostics(rec_response, max_expected_tokens=recovery_max_tokens)
 
                     if rec_diag.extracted_text:
-                        rec_cleaned = clean_json_text(rec_diag.extracted_text)
-                        if rec_cleaned:
-                            try:
-                                candidate_dict = json.loads(rec_cleaned)
-                                if isinstance(candidate_dict, dict) and isinstance(candidate_dict.get("proposed_content"), str):
-                                    data = candidate_dict
-                                    rec_diag.failure_category = "success"
-                                else:
-                                    rec_diag.failure_category = "malformed_output"
-                            except (json.JSONDecodeError, ValueError):
-                                if rec_diag.finish_reason == "MAX_TOKENS":
-                                    rec_diag.failure_category = "output_truncated"
-                                else:
-                                    rec_diag.failure_category = "malformed_output"
+                        rec_status, rec_data, rec_parse_err = extract_patch_candidate(
+                            rec_diag.extracted_text, finding, file_content, repo_path
+                        )
+                        if rec_status == "success":
+                            data = rec_data
+                            rec_diag.failure_category = "success"
+                        elif rec_diag.finish_reason == "MAX_TOKENS":
+                            rec_diag.failure_category = "output_truncated"
+                        elif rec_status == "invalid_path":
+                            rec_diag.failure_category = "invalid_target_path"
                         else:
                             rec_diag.failure_category = "malformed_output"
 
@@ -1178,44 +1585,30 @@ class GemmaApiProvider(BaseAIProvider):
                 record_diagnostics_to_span(span, diag, recovery_attempts=recovery_attempts)
 
                 proposed_content = data.get("proposed_content", "")
-                if not proposed_content.strip():
+                diff_str = data.get("diff", "")
+                if not proposed_content.strip() or not diff_str.strip():
                     raise GemmaApiResponseError(
-                        "Hosted Gemma response did not contain usable proposed_content string."
+                        "Hosted Gemma response did not contain usable proposed_content or unified diff."
                     )
 
-                if proposed_content and proposed_content != file_content:
-                    diff_lines = list(difflib.unified_diff(
-                        file_content.splitlines(keepends=True),
-                        proposed_content.splitlines(keepends=True),
-                        fromfile=f"a/{finding.file_path}",
-                        tofile=f"b/{finding.file_path}",
-                    ))
-                    if not diff_lines:
-                        raise GemmaApiResponseError(
-                            "Model proposed_content produced an empty unified diff."
-                        )
-
-                    patch = ProposedPatch(
-                        id=f"patch-{finding.id}",
-                        finding_id=finding.id,
-                        file_path=finding.file_path,
-                        change_summary=data.get("change_summary", f"Fix {finding.title}"),
-                        original_content=file_content,
-                        proposed_content=proposed_content,
-                        diff="".join(diff_lines),
-                        explanation=data.get("explanation", finding.explanation),
-                        risks_assumptions=data.get("risks_assumptions", "Low risk minimal change."),
-                        suggested_verification=data.get("suggested_verification", "Check syntax and tests."),
-                        status=PatchStatus.PENDING,
-                        is_demo=False,
-                        ai_model=self.model,
-                    )
-                    span.set_outcome("completed")
-                    span.set_tag("patches_count", 1)
-                    return patch
-                else:
-                    span.set_outcome("failed", details="Model proposed_content was identical to original")
-                    return None
+                patch = ProposedPatch(
+                    id=f"patch-{finding.id}",
+                    finding_id=finding.id,
+                    file_path=finding.file_path,
+                    change_summary=data.get("change_summary", f"Fix {finding.title}"),
+                    original_content=file_content,
+                    proposed_content=proposed_content,
+                    diff=diff_str,
+                    explanation=data.get("explanation", finding.explanation),
+                    risks_assumptions=data.get("risks_assumptions", "Low risk minimal change."),
+                    suggested_verification=data.get("suggested_verification", "Check syntax and tests."),
+                    status=PatchStatus.PENDING,
+                    is_demo=False,
+                    ai_model=self.model,
+                )
+                span.set_outcome("completed")
+                span.set_tag("patches_count", 1)
+                return patch
             except Exception as e:
                 sanitized_err = sanitize_error_message(str(e))
                 err_category = classify_patch_error(e)

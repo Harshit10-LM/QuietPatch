@@ -2338,3 +2338,678 @@ def test_patch_service_and_proposal_reject_unsafe_paths_and_malformed_diffs(tmp_
         assert "cannot be empty" in str(pe)
 
 
+def _make_mock_genai_response(
+    text: str,
+    finish_reason: str = "STOP",
+    prompt_tokens: int = 400,
+    candidate_tokens: int = 200,
+    total_tokens: int = 600,
+) -> MagicMock:
+    """Helper fixture to create deterministic mock Google Gen AI response."""
+    resp = MagicMock()
+    cand = MagicMock(finish_reason=finish_reason)
+    cand.content = MagicMock(parts=[MagicMock(text=text, thought=False)])
+    resp.candidates = [cand]
+    resp.text = text
+
+    class FakeUsage:
+        def __init__(self, pt, ct, tt):
+            self.prompt_token_count = pt
+            self.candidates_token_count = ct
+            self.total_token_count = tt
+
+    resp.usage_metadata = FakeUsage(prompt_tokens, candidate_tokens, total_tokens)
+    return resp
+
+
+def test_patch_proposal_accepts_valid_raw_unified_diff(tmp_path):
+    """Regression test: Gemma returns a valid raw unified diff without JSON or fences.
+    The provider extracts the diff, validates the target path, applies it, and generates ProposedPatch.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = "# Project Title\n\nIntro line.\n"
+    finding = Finding(
+        id="f-raw-diff",
+        category=FindingCategory.DOCUMENTATION,
+        title="Fix title",
+        file_path="README.md",
+        evidence="Title typo",
+        explanation="Update project title",
+        suggested_action="Change to QuietPatch",
+    )
+
+    raw_diff = (
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1,3 +1,3 @@\n"
+        "-# Project Title\n"
+        "+# QuietPatch Project\n"
+        " \n"
+        " Intro line.\n"
+    )
+
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(raw_diff)
+
+    patch = provider.propose_patch(finding, original_content, tmp_path, run_id="run-raw-diff")
+    assert patch is not None
+    assert patch.finding_id == "f-raw-diff"
+    assert patch.file_path == "README.md"
+    assert patch.proposed_content == "# QuietPatch Project\n\nIntro line.\n"
+    assert "QuietPatch Project" in patch.diff
+    assert patch.status == PatchStatus.PENDING
+    assert patch.is_demo is False
+    assert mock_client.models.generate_content.call_count == 1
+
+
+def test_patch_proposal_accepts_valid_diff_inside_markdown_code_fence(tmp_path):
+    """Regression test: Gemma returns a valid diff enclosed in ```diff with conversational intro.
+    The provider extracts the fenced diff and generates ProposedPatch.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = "def add(a, b):\n    return a - b\n"
+    finding = Finding(
+        id="f-fenced-diff",
+        category=FindingCategory.PYTHON,
+        title="Fix subtraction in add",
+        file_path="math.py",
+        evidence="return a - b",
+        explanation="Add should add",
+        suggested_action="return a + b",
+    )
+
+    fenced_text = (
+        "Here is the unified diff to fix the subtraction bug:\n"
+        "```diff\n"
+        "--- a/math.py\n"
+        "+++ b/math.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def add(a, b):\n"
+        "-    return a - b\n"
+        "+    return a + b\n"
+        "```\n"
+        "This resolves the calculation error.\n"
+    )
+
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(fenced_text)
+
+    patch = provider.propose_patch(finding, original_content, tmp_path, run_id="run-fenced-diff")
+    assert patch is not None
+    assert patch.proposed_content == "def add(a, b):\n    return a + b\n"
+    assert "-    return a - b" in patch.diff
+    assert "+    return a + b" in patch.diff
+    assert mock_client.models.generate_content.call_count == 1
+
+
+def test_patch_proposal_accepts_valid_diff_inside_json_response_structure(tmp_path):
+    """Regression test: Gemma returns JSON containing 'diff' or 'patch' instead of 'proposed_content'.
+    The provider extracts and applies the diff cleanly.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = "DEBUG = True\n"
+    finding = Finding(
+        id="f-json-diff",
+        category=FindingCategory.CONFIGURATION,
+        title="Disable debug mode",
+        file_path="config.py",
+        evidence="DEBUG = True",
+        explanation="Debug mode enabled in production",
+        suggested_action="Set DEBUG = False",
+    )
+
+    json_with_diff = json.dumps({
+        "change_summary": "Set DEBUG to False",
+        "diff": "--- a/config.py\n+++ b/config.py\n@@ -1,1 +1,1 @@\n-DEBUG = True\n+DEBUG = False\n",
+        "explanation": "Security requirement for production",
+        "risks_assumptions": "None",
+        "suggested_verification": "Check config",
+    })
+
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(json_with_diff)
+
+    patch = provider.propose_patch(finding, original_content, tmp_path, run_id="run-json-diff")
+    assert patch is not None
+    assert patch.proposed_content == "DEBUG = False\n"
+    assert "DEBUG = False" in patch.diff
+    assert patch.change_summary == "Set DEBUG to False"
+    assert mock_client.models.generate_content.call_count == 1
+
+
+def test_patch_proposal_accepts_valid_json_with_internal_code_fences_and_preamble(tmp_path):
+    """Exact reproduction test for finding-doc-broken-25ec2a11:
+    The file README.md contains internal bash code blocks.
+    When Gemma outputs JSON wrapped in an outer code fence or with preamble,
+    clean_json_text must NOT truncate at the first internal code fence.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = (
+        "# Sample Project\n\n"
+        "## Setup\n"
+        "```bash\n"
+        "cp .env.example .env\n"
+        "```\n\n"
+        "## Testing\n"
+        "```bash\n"
+        "pytest tests/\n"
+        "```\n"
+    )
+
+    finding = Finding(
+        id="finding-doc-broken-25ec2a11",
+        category=FindingCategory.DOCUMENTATION,
+        title="Fix broken relative doc links",
+        file_path="README.md",
+        evidence="Broken link to docs",
+        explanation="README references nonexistent link",
+        suggested_action="Update link",
+    )
+
+    fixed_content = (
+        "# Sample Project\n\n"
+        "## Setup\n"
+        "```bash\n"
+        "cp .env.example .env\n"
+        "```\n\n"
+        "## Documentation\n"
+        "See docs/index.md for details.\n\n"
+        "## Testing\n"
+        "```bash\n"
+        "pytest tests/\n"
+        "```\n"
+    )
+
+    model_raw_output = (
+        "Here is the proposed patch for README.md:\n"
+        "```json\n"
+        + json.dumps({
+            "change_summary": "Add link to docs/index.md in README",
+            "proposed_content": fixed_content,
+            "explanation": "Fixes broken documentation reference.",
+            "risks_assumptions": "None.",
+            "suggested_verification": "Verify markdown rendering.",
+        })
+        + "\n```\nHope this helps!"
+    )
+
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(
+        model_raw_output, finish_reason="STOP", prompt_tokens=458, candidate_tokens=441, total_tokens=899
+    )
+
+    patch = provider.propose_patch(finding, original_content, tmp_path, run_id="run-doc-25ec2a11")
+    assert patch is not None
+    assert patch.finding_id == "finding-doc-broken-25ec2a11"
+    assert "See docs/index.md for details." in patch.proposed_content
+    # Crucial: verify internal bash blocks are preserved intact
+    assert "cp .env.example .env" in patch.proposed_content
+    assert "pytest tests/" in patch.proposed_content
+    assert mock_client.models.generate_content.call_count == 1
+
+
+def test_patch_proposal_valid_model_text_without_patch_triggers_corrective_recovery(tmp_path):
+    """Regression test: Gemma returns conversational text without a patch or diff on attempt 1.
+    Response diagnostics classifies it as no_patch_content (malformed_output).
+    The provider triggers a corrective recovery prompt specifically asking for a unified diff.
+    Recovery returns a valid unified diff, and the patch is generated successfully.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = "PORT = 8000\n"
+    finding = Finding(
+        id="f-prose-only",
+        category=FindingCategory.CONFIGURATION,
+        title="Change port",
+        file_path="server.py",
+        evidence="PORT = 8000",
+        explanation="Change to 8080",
+        suggested_action="Use port 8080",
+    )
+
+    # Attempt 1: Conversational prose without diff or JSON
+    resp1 = _make_mock_genai_response(
+        "I examined server.py. You should change the PORT variable to 8080 to avoid conflicts.",
+        finish_reason="STOP",
+        total_tokens=300,
+    )
+
+    # Attempt 2 (Recovery): Valid unified diff
+    resp2 = _make_mock_genai_response(
+        "--- a/server.py\n+++ b/server.py\n@@ -1,1 +1,1 @@\n-PORT = 8000\n+PORT = 8080\n",
+        finish_reason="STOP",
+        total_tokens=250,
+    )
+
+    mock_client.models.generate_content.side_effect = [resp1, resp2]
+
+    patch = provider.propose_patch(finding, original_content, tmp_path, run_id="run-prose-recovery")
+    assert patch is not None
+    assert patch.proposed_content == "PORT = 8080\n"
+    assert mock_client.models.generate_content.call_count == 2
+
+    # Verify recovery prompt was specifically tailored for no_patch_content
+    recovery_call = mock_client.models.generate_content.call_args_list[1]
+    prompt_used = recovery_call.kwargs.get("contents") or recovery_call[1].get("contents")
+    assert "did not provide a reviewable patch or unified diff" in prompt_used
+
+
+def test_patch_proposal_malformed_json_triggers_json_corrective_recovery(tmp_path):
+    """Regression test: Gemma returns malformed JSON on attempt 1.
+    The provider classifies it as invalid_json and issues a targeted recovery prompt.
+    Recovery returns valid JSON, and the patch is accepted.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = "val = 1\n"
+    finding = Finding(
+        id="f-bad-json",
+        category=FindingCategory.PYTHON,
+        title="Update val",
+        file_path="app.py",
+        evidence="val = 1",
+        explanation="val should be 2",
+        suggested_action="Set val = 2",
+    )
+
+    # Attempt 1: Malformed JSON
+    resp1 = _make_mock_genai_response(
+        '{"change_summary": "Update val", "proposed_content": "val = 2\n',  # missing closing brace
+        finish_reason="STOP",
+    )
+
+    # Attempt 2: Clean JSON
+    valid_json = json.dumps({
+        "change_summary": "Update val to 2",
+        "proposed_content": "val = 2\n",
+        "explanation": "Updated value",
+        "risks_assumptions": "None",
+        "suggested_verification": "Test",
+    })
+    resp2 = _make_mock_genai_response(valid_json, finish_reason="STOP")
+
+    mock_client.models.generate_content.side_effect = [resp1, resp2]
+
+    patch = provider.propose_patch(finding, original_content, tmp_path, run_id="run-bad-json-rec")
+    assert patch is not None
+    assert patch.proposed_content == "val = 2\n"
+    assert mock_client.models.generate_content.call_count == 2
+
+    recovery_call = mock_client.models.generate_content.call_args_list[1]
+    prompt_used = recovery_call.kwargs.get("contents") or recovery_call[1].get("contents")
+    assert "invalid or malformed JSON syntax" in prompt_used
+
+
+def test_patch_proposal_malformed_diff_triggers_diff_corrective_recovery(tmp_path):
+    """Regression test: Gemma returns a unified diff whose context lines do not match
+    the original file (invalid_diff).
+    The provider triggers a corrective recovery prompt specifically identifying the context mismatch.
+    Recovery returns a matching diff, and patch is generated.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = "line1\nline2\nline3\n"
+    finding = Finding(
+        id="f-bad-diff",
+        category=FindingCategory.PYTHON,
+        title="Update line2",
+        file_path="file.py",
+        evidence="line2",
+        explanation="Update line2",
+        suggested_action="line2 updated",
+    )
+
+    # Attempt 1: Diff with hallucinated context lines that don't match line1/line2/line3
+    bad_diff = (
+        "--- a/file.py\n"
+        "+++ b/file.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " completely_wrong_context_line\n"
+        "-line2\n"
+        "+line2_updated\n"
+        " line3\n"
+    )
+    resp1 = _make_mock_genai_response(bad_diff, finish_reason="STOP")
+
+    # Attempt 2: Correct diff matching original content
+    good_diff = (
+        "--- a/file.py\n"
+        "+++ b/file.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " line1\n"
+        "-line2\n"
+        "+line2_updated\n"
+        " line3\n"
+    )
+    resp2 = _make_mock_genai_response(good_diff, finish_reason="STOP")
+
+    mock_client.models.generate_content.side_effect = [resp1, resp2]
+
+    patch = provider.propose_patch(finding, original_content, tmp_path, run_id="run-diff-rec")
+    assert patch is not None
+    assert patch.proposed_content == "line1\nline2_updated\nline3\n"
+    assert mock_client.models.generate_content.call_count == 2
+
+    recovery_call = mock_client.models.generate_content.call_args_list[1]
+    prompt_used = recovery_call.kwargs.get("contents") or recovery_call[1].get("contents")
+    assert "could not apply cleanly" in prompt_used
+
+
+def test_patch_proposal_rejects_wrong_target_path_and_path_traversal_immediately(tmp_path):
+    """Regression test: Target file validation rejects:
+    1. Path traversal with ..
+    2. Absolute paths
+    3. Mismatched target file names
+    All without attempting model recovery.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-path-check",
+        category=FindingCategory.PYTHON,
+        title="Fix file",
+        file_path="safe/app.py",
+        evidence="x",
+        explanation="e",
+        suggested_action="a",
+    )
+
+    # 1. Path traversal attempt
+    traversal_diff = (
+        "--- a/../../etc/passwd\n"
+        "+++ b/../../etc/passwd\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-root:x:0:0\n"
+        "+hacked:x:0:0\n"
+    )
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(traversal_diff)
+    p1 = provider.propose_patch(finding, "safe content\n", tmp_path)
+    assert p1 is None
+    # Must reject immediately without recovery call (call_count == 1)
+    assert mock_client.models.generate_content.call_count == 1
+
+    # 2. Absolute path attempt
+    mock_client.models.generate_content.reset_mock()
+    abs_diff = (
+        "--- a//etc/shadow\n"
+        "+++ b//etc/shadow\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-root:*\n"
+        "+root:hacked\n"
+    )
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(abs_diff)
+    p2 = provider.propose_patch(finding, "safe content\n", tmp_path)
+    assert p2 is None
+    assert mock_client.models.generate_content.call_count == 1
+
+    # 3. Mismatched target file name
+    mock_client.models.generate_content.reset_mock()
+    wrong_file_diff = (
+        "--- a/other/script.py\n"
+        "+++ b/other/script.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(wrong_file_diff)
+    p3 = provider.propose_patch(finding, "safe content\n", tmp_path)
+    assert p3 is None
+    assert mock_client.models.generate_content.call_count == 1
+
+
+def test_patch_proposal_initial_malformed_followed_by_second_malformed_fails_cleanly(tmp_path):
+    """Regression test: Both initial and recovery responses return malformed output with finish_reason=STOP.
+    propose_patch stops cleanly after exactly 2 calls, returns None, and classifies error as malformed_output.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-two-malformed",
+        category=FindingCategory.DOCUMENTATION,
+        title="Check doc",
+        file_path="README.md",
+        evidence="ev",
+        explanation="exp",
+        suggested_action="act",
+    )
+
+    resp1 = _make_mock_genai_response("just some unrelated prose 1", finish_reason="STOP", total_tokens=899)
+    resp2 = _make_mock_genai_response("still just unrelated prose 2", finish_reason="STOP", total_tokens=919)
+
+    mock_client.models.generate_content.side_effect = [resp1, resp2]
+
+    patch = provider.propose_patch(finding, "# Readme\n", tmp_path, run_id="run-two-malformed")
+    assert patch is None
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_patch_proposal_transient_500_followed_by_success(tmp_path):
+    """Regression test: Patch request encounters transient HTTP 500 on first call,
+    retries within budget, and succeeds on second call.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=2, backoff_factor=0.01)
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    err_500 = genai_errors.ServerError(500, "Internal Server Error")
+    resp_ok = _make_mock_genai_response(
+        "--- a/README.md\n+++ b/README.md\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+    )
+
+    mock_client.models.generate_content.side_effect = [err_500, resp_ok]
+
+    finding = Finding(
+        id="f-500-retry",
+        category=FindingCategory.DOCUMENTATION,
+        title="Fix doc",
+        file_path="README.md",
+        evidence="x",
+        explanation="e",
+        suggested_action="a",
+    )
+
+    patch = provider.propose_patch(finding, "old\n", tmp_path, run_id="run-500-retry")
+    assert patch is not None
+    assert patch.proposed_content == "new\n"
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_patch_proposal_exhausted_retries_does_not_crash_maintenance_run(tmp_path):
+    """Regression test: Upstream 500 exhaustion in patch proposal does not crash
+    the maintenance run or raise an unhandled exception.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it", max_retries=1, backoff_factor=0.01)
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    err_500 = genai_errors.ServerError(500, "Continuous 500 error")
+    mock_client.models.generate_content.side_effect = err_500
+
+    finding = Finding(
+        id="f-500-exhaust",
+        category=FindingCategory.DOCUMENTATION,
+        title="Fix doc",
+        file_path="README.md",
+        evidence="x",
+        explanation="e",
+        suggested_action="a",
+    )
+
+    # Should catch gracefully and return None
+    patch = provider.propose_patch(finding, "content\n", tmp_path, run_id="run-500-exhaust")
+    assert patch is None
+
+
+def test_maintenance_run_preserves_earlier_successful_patches_when_finding_encounters_malformed_output(tmp_path):
+    """Regression test: In a maintenance run with 3 findings:
+    - Finding 1 succeeds via JSON response
+    - Finding 2 succeeds via raw unified diff response
+    - Finding 3 encounters malformed output on initial and recovery
+    The run completes with status='completed', stage 'proposal' is 'partial',
+    and both patches 1 and 2 are preserved in DB and returned.
+    """
+    f1_file = tmp_path / "LICENSE"
+    f1_file.write_text("Old License\n", encoding="utf-8")
+    f2_file = tmp_path / ".gitignore"
+    f2_file.write_text("node_modules\n", encoding="utf-8")
+    f3_file = tmp_path / "README.md"
+    f3_file.write_text("# Old Title\n", encoding="utf-8")
+
+    f1 = Finding(
+        id="f-succ-1",
+        category=FindingCategory.GENERAL,
+        title="Fix license",
+        file_path="LICENSE",
+        evidence="Old License",
+        explanation="Update license",
+        suggested_action="Update to MIT",
+        severity=Severity.HIGH,
+        ai_assisted=True,
+    )
+    f2 = Finding(
+        id="f-succ-2",
+        category=FindingCategory.GENERAL,
+        title="Update gitignore",
+        file_path=".gitignore",
+        evidence="node_modules",
+        explanation="Add .env",
+        suggested_action="Add .env",
+        severity=Severity.MEDIUM,
+        ai_assisted=True,
+    )
+    f3 = Finding(
+        id="finding-doc-broken-25ec2a11",
+        category=FindingCategory.DOCUMENTATION,
+        title="Broken doc link",
+        file_path="README.md",
+        evidence="broken",
+        explanation="exp",
+        suggested_action="act",
+        severity=Severity.LOW,
+        ai_assisted=True,
+    )
+
+    mock_client = MagicMock()
+
+    # Call 1: Finding 1 patch -> JSON
+    resp1 = _make_mock_genai_response(
+        json.dumps({
+            "change_summary": "Update license to MIT",
+            "proposed_content": "MIT License\n",
+            "explanation": "Standard open source license",
+            "risks_assumptions": "None",
+            "suggested_verification": "Check text",
+        })
+    )
+    # Call 2: Finding 2 patch -> Raw unified diff
+    resp2 = _make_mock_genai_response(
+        "--- a/.gitignore\n+++ b/.gitignore\n@@ -1,1 +1,2 @@\n node_modules\n+.env\n"
+    )
+    # Call 3: Finding 3 patch (initial) -> Malformed text (STOP)
+    resp3_init = _make_mock_genai_response("unrelated conversational text", finish_reason="STOP", total_tokens=899)
+    # Call 4: Finding 3 patch (recovery) -> Still malformed (STOP)
+    resp3_rec = _make_mock_genai_response("more conversational text", finish_reason="STOP", total_tokens=919)
+
+    mock_client.models.generate_content.side_effect = [resp1, resp2, resp3_init, resp3_rec]
+
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    provider._client = mock_client
+
+    agent = AgentService(provider_name="gemma_api")
+    agent.provider = provider
+
+    with patch.object(agent.scan_engine, "discover_files", return_value=([f1_file, f2_file, f3_file], 100)), \
+         patch.object(agent.scan_engine, "run_scanners", return_value=([f1, f2, f3], {})), \
+         patch.object(provider, "analyze_and_prioritize", return_value=[f1, f2, f3]):
+
+        run = agent.execute_maintenance_run(
+            repo_path=tmp_path,
+            repo_name="MultiPatchPreserveRepo",
+            repo_type="local",
+            run_id="run-multi-preserve",
+        )
+
+    # 1. Patches 1 and 2 are preserved!
+    assert len(run.patches) == 2
+    assert {p.finding_id for p in run.patches} == {"f-succ-1", "f-succ-2"}
+
+    # 2. Proposal stage status is partial
+    assert run.stages["proposal"].status == "partial"
+    assert "2/3 patches" in run.stages["proposal"].details
+    assert "1 patch generation attempts failed" in run.stages["proposal"].details
+
+    # 3. Overall run completed cleanly
+    assert run.status == "completed"
+    assert mock_client.models.generate_content.call_count == 4
+
+
+def test_sentry_classification_and_truthful_ai_assisted_status(tmp_path):
+    """Regression test: When malformed output is encountered, Sentry spans record
+    failure_category='malformed_output', finish_reason='STOP', token usage,
+    and no prompts, source code, or secrets leak into tags or data.
+    """
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-sentry-diag",
+        category=FindingCategory.DOCUMENTATION,
+        title="Check doc",
+        file_path="README.md",
+        evidence="sample-evidence",
+        explanation="Default explanation",
+        suggested_action="Default action",
+    )
+
+    resp_malformed1 = _make_mock_genai_response(
+        "conversational text without diff", finish_reason="STOP", prompt_tokens=400, candidate_tokens=100, total_tokens=500
+    )
+    resp_malformed2 = _make_mock_genai_response(
+        "still conversational text", finish_reason="STOP", prompt_tokens=450, candidate_tokens=110, total_tokens=560
+    )
+    mock_client.models.generate_content.side_effect = [resp_malformed1, resp_malformed2]
+
+    fake_span = MagicMock()
+    fake_span_context = MagicMock(__enter__=MagicMock(return_value=fake_span), __exit__=MagicMock(return_value=False))
+
+    with patch("backend.ai.gemma_api_provider.agent_stage_span", return_value=fake_span_context):
+        result = provider.propose_patch(finding, "# Readme\n", tmp_path, run_id="run-sentry-test")
+        assert result is None
+
+    # Check tags set on span
+    span_tags = {call[0][0]: call[0][1] for call in fake_span.set_tag.call_args_list}
+    span_data = {call[0][0]: call[0][1] for call in fake_span.set_data.call_args_list}
+
+    assert span_tags.get("error_category") == "malformed_output"
+    assert span_data.get("failure_category") == "malformed_output"
+    assert span_tags.get("finish_reason") == "STOP"
+    assert span_tags.get("has_response") is True
+    assert span_data.get("total_tokens") == 560
+    assert span_data.get("recovery_attempt_count") == 1
+
+    # Verify no source code, evidence, or prompt leaked in tags or data
+    for key, val in {**span_tags, **span_data}.items():
+        val_str = str(val)
+        assert "# Readme" not in val_str
+        assert "sample-evidence" not in val_str
+
+
