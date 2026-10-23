@@ -94,6 +94,13 @@ class ResponseDiagnostics:
         total_tokens: Optional[int] = None,
         extracted_text: Optional[str] = None,
         failure_category: Optional[str] = None,
+        finding_id: Optional[str] = None,
+        resembles_json: bool = False,
+        is_fenced: bool = False,
+        json_error_category: Optional[str] = None,
+        json_error_position: Optional[int] = None,
+        edit_validation_category: Optional[str] = None,
+        recovery_outcome: Optional[str] = None,
     ):
         self.has_response = has_response
         self.candidate_count = candidate_count
@@ -106,6 +113,13 @@ class ResponseDiagnostics:
         self.total_tokens = total_tokens
         self.extracted_text = extracted_text
         self.failure_category = failure_category
+        self.finding_id = finding_id
+        self.resembles_json = resembles_json
+        self.is_fenced = is_fenced
+        self.json_error_category = json_error_category
+        self.json_error_position = json_error_position
+        self.edit_validation_category = edit_validation_category
+        self.recovery_outcome = recovery_outcome
 
     @property
     def canonical_category(self) -> str:
@@ -119,7 +133,11 @@ class ResponseDiagnostics:
             "empty_output", "thought_only_exhaustion", "no_response",
         }:
             return "empty_response"
-        if self.failure_category in {"malformed_output", "malformed_json", "no_patch_content", "invalid_diff"}:
+        if self.failure_category in {
+            "malformed_output", "malformed_json", "no_patch_content", "invalid_diff",
+            "missing_edits", "malformed_edit", "empty_old_text",
+            "missing_old_text_match", "ambiguous_old_text", "overlapping_edits",
+        }:
             return "malformed_output"
         if self.failure_category in {"invalid_target_path", "no_op_patch"}:
             return self.failure_category
@@ -146,6 +164,12 @@ class ResponseDiagnostics:
             "malformed_json",
             "no_patch_content",
             "invalid_diff",
+            "missing_edits",
+            "malformed_edit",
+            "empty_old_text",
+            "missing_old_text_match",
+            "ambiguous_old_text",
+            "overlapping_edits",
         }
 
     def sanitized_summary(self) -> str:
@@ -155,10 +179,13 @@ class ResponseDiagnostics:
             else "none"
         )
         return (
-            f"has_response={self.has_response}, candidates={self.candidate_count}, "
-            f"text_parts={self.text_part_count}, finish_reason={self.finish_reason or 'none'}, "
-            f"block_reason={self.block_reason or 'none'}, tokens={tokens_summary}, "
-            f"category={self.failure_category or 'none'}"
+            f"finding_id={self.finding_id or 'none'}, has_response={self.has_response}, "
+            f"candidates={self.candidate_count}, text_parts={self.text_part_count}, "
+            f"finish_reason={self.finish_reason or 'none'}, block_reason={self.block_reason or 'none'}, "
+            f"resembles_json={self.resembles_json}, is_fenced={self.is_fenced}, "
+            f"json_err={self.json_error_category or 'none'}(pos={self.json_error_position if self.json_error_position is not None else 'none'}), "
+            f"edit_err={self.edit_validation_category or 'none'}, "
+            f"tokens={tokens_summary}, category={self.failure_category or 'none'}"
         )
 
 
@@ -197,9 +224,11 @@ def classify_patch_error(exc: Exception) -> str:
         return "output_token_truncated"
     if "invalid_target_path" in msg or "target path rejected" in msg or "unexpected_target_file" in msg or "path_traversal" in msg:
         return "invalid_target_path"
-    if "no_op_patch" in msg or "identical to original" in msg or "empty unified diff" in msg:
+    if "no_op_patch" in msg or "identical to original" in msg or "empty unified diff" in msg or "no change" in msg:
         return "no_op_patch"
-    if isinstance(exc, json.JSONDecodeError) or "malformed" in msg or "jsondecodeerror" in exc_type or "invalid_diff" in msg:
+    if any(k in msg for k in ("missing_old_text", "ambiguous_old_text", "overlapping_edits", "malformed_edit", "missing_edits", "empty_old_text")):
+        return "malformed_output"
+    if isinstance(exc, json.JSONDecodeError) or "malformed" in msg or "jsondecodeerror" in exc_type or "invalid_diff" in msg or "invalid_json" in msg:
         return "malformed_output"
     if isinstance(exc, GemmaApiTransientError):
         return "transient_api_error"
@@ -369,6 +398,227 @@ def extract_response_text(response: Any) -> Optional[str]:
     """Safely extracts text content from Google Gen AI GenerateContentResponse."""
     diag = extract_response_diagnostics(response)
     return diag.extracted_text
+
+
+def parse_json_response(raw_text: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Normalizes and safely parses model JSON output without greedy regex extraction.
+
+    Supports only unambiguous, well-defined variants:
+    1. Plain JSON object.
+    2. JSON object surrounded by a Markdown code fence (e.g. ```json ... ``` or ``` ... ```),
+       with optional introductory or concluding lines.
+    3. Harmless leading and trailing whitespace.
+
+    Returns:
+    (parsed_dict, metadata)
+    where metadata contains:
+    - resembles_json: bool
+    - is_fenced: bool
+    - json_error_category: Optional[str]
+    - json_error_position: Optional[int]
+    """
+    if not raw_text or not isinstance(raw_text, str) or not raw_text.strip():
+        return None, {
+            "resembles_json": False,
+            "is_fenced": False,
+            "json_error_category": "empty_text",
+            "json_error_position": None,
+        }
+
+    t = raw_text.strip()
+    is_fenced = False
+
+    # Check for Markdown code fence
+    fence_start = t.find("```")
+    if fence_start != -1:
+        fence_end = t.rfind("```")
+        if fence_end > fence_start + 2:
+            is_fenced = True
+            inner = t[fence_start + 3:fence_end].strip()
+            # If the first line is an info string like 'json' or 'JSON', strip it
+            if "\n" in inner:
+                first_line, rest = inner.split("\n", 1)
+                if first_line.strip().lower() in ("json", "javascript", "python", ""):
+                    inner = rest.strip()
+            elif inner.lower().startswith("json"):
+                inner = inner[4:].strip()
+            t = inner
+        else:
+            # Unclosed or malformed fence
+            return None, {
+                "resembles_json": False,
+                "is_fenced": True,
+                "json_error_category": "unclosed_markdown_fence",
+                "json_error_position": None,
+            }
+
+    resembles_json = t.startswith("{") or t.startswith("[") or t.endswith("}") or t.endswith("]")
+
+    if not resembles_json:
+        return None, {
+            "resembles_json": False,
+            "is_fenced": is_fenced,
+            "json_error_category": "non_json_format",
+            "json_error_position": None,
+        }
+
+    try:
+        parsed = json.loads(t)
+        if isinstance(parsed, dict):
+            return parsed, {
+                "resembles_json": True,
+                "is_fenced": is_fenced,
+                "json_error_category": None,
+                "json_error_position": None,
+            }
+        else:
+            return None, {
+                "resembles_json": True,
+                "is_fenced": is_fenced,
+                "json_error_category": "expected_json_object",
+                "json_error_position": 0,
+            }
+    except json.JSONDecodeError as err:
+        err_cat = err.msg.lower().replace(" ", "_").replace("'", "").replace('"', "")
+        return None, {
+            "resembles_json": True,
+            "is_fenced": is_fenced,
+            "json_error_category": err_cat,
+            "json_error_position": err.pos,
+        }
+
+
+def validate_and_apply_structured_edits(
+    candidate_dict: Dict[str, Any],
+    finding: Finding,
+    original_content: str,
+    repo_path: Optional[Path] = None,
+) -> Tuple[str, Optional[Dict[str, Any]], str, Optional[str]]:
+    """Validates structured edit operations against file contents and security policies,
+    applies them in-memory, and deterministically generates a standard unified diff.
+
+    Returns:
+    (status, patch_data, error_detail, edit_err_category)
+    """
+    if not isinstance(candidate_dict, dict):
+        return "malformed_output", None, "Candidate edit proposal must be a JSON object", "malformed_output"
+
+    target_path = candidate_dict.get("target_path")
+    if not target_path or not isinstance(target_path, str) or not target_path.strip():
+        return "invalid_target_path", None, "Missing or empty target_path in structured edits", "missing_target_path"
+
+    # 1. Path traversal and absolute path validation
+    target_clean = target_path.strip()
+    if Path(target_clean).is_absolute() or target_clean.startswith("/") or target_clean.startswith("\\"):
+        return "invalid_target_path", None, f"Absolute target path prohibited: {target_path}", "absolute_path_prohibited"
+
+    clean_parts = Path(target_clean.lstrip("/")).parts
+    if ".." in clean_parts:
+        return "invalid_target_path", None, f"Path traversal ('..') prohibited: {target_path}", "path_traversal_prohibited"
+
+    # 2. Strict matching against finding.file_path
+    norm_target = str(Path(target_clean.lstrip("/"))).lstrip("./")
+    norm_finding = str(Path(finding.file_path.strip().lstrip("/"))).lstrip("./")
+    if norm_target != norm_finding:
+        return "invalid_target_path", None, f"target_path '{target_path}' does not match expected finding file '{finding.file_path}'", "unexpected_target_file"
+
+    # 3. Repository root boundary & symlink validation
+    if repo_path:
+        try:
+            full_path = (repo_path / target_clean.lstrip("/")).resolve()
+            full_path.relative_to(repo_path.resolve())
+            if full_path.is_symlink():
+                return "invalid_target_path", None, f"Modifying symlinks is prohibited: {target_path}", "symlink_prohibited"
+        except Exception:
+            return "invalid_target_path", None, f"Target path escapes repository root: {target_path}", "escapes_repository_root"
+
+    # 4. Edits array validation
+    edits = candidate_dict.get("edits")
+    if edits is None or not isinstance(edits, list) or len(edits) == 0:
+        return "missing_edits", None, "Candidate must contain a non-empty 'edits' list", "missing_edits"
+
+    spans = []
+    for idx, edit in enumerate(edits):
+        if not isinstance(edit, dict):
+            return "malformed_edit", None, f"Edit at index {idx} must be an object", "malformed_edit"
+        if "old_text" not in edit or "new_text" not in edit:
+            return "malformed_edit", None, f"Edit at index {idx} must have 'old_text' and 'new_text'", "malformed_edit"
+        if not isinstance(edit["old_text"], str) or not isinstance(edit["new_text"], str):
+            return "malformed_edit", None, f"Edit at index {idx} 'old_text' and 'new_text' must be strings", "malformed_edit"
+
+        old_text = edit["old_text"]
+        new_text = edit["new_text"]
+
+        if not old_text:
+            return "empty_old_text", None, f"Edit at index {idx} 'old_text' cannot be empty", "empty_old_text"
+
+        # Check occurrence count in original_content
+        match_count = original_content.count(old_text)
+        if match_count == 0:
+            return "missing_old_text_match", None, f"Edit at index {idx} 'old_text' not found in file content", "missing_old_text_match"
+        if match_count > 1:
+            return "ambiguous_old_text", None, f"Edit at index {idx} 'old_text' matches {match_count} times in file content (must match exactly once)", "ambiguous_old_text"
+
+        start_pos = original_content.find(old_text)
+        end_pos = start_pos + len(old_text)
+        spans.append((start_pos, end_pos, edit, idx))
+
+    # 5. Overlap detection
+    sorted_spans = sorted(spans, key=lambda s: s[0])
+    for i in range(len(sorted_spans) - 1):
+        cur_start, cur_end, _, cur_idx = sorted_spans[i]
+        nxt_start, _, _, nxt_idx = sorted_spans[i + 1]
+        if cur_end > nxt_start:
+            return "overlapping_edits", None, f"Edit {cur_idx} and edit {nxt_idx} overlap in file content", "overlapping_edits"
+
+    # 6. Apply edits in-memory preserving line endings and unrelated content
+    pieces = []
+    last_pos = 0
+    for start_pos, end_pos, edit, _ in sorted_spans:
+        pieces.append(original_content[last_pos:start_pos])
+        pieces.append(edit["new_text"])
+        last_pos = end_pos
+    pieces.append(original_content[last_pos:])
+    modified_content = "".join(pieces)
+
+    if modified_content == original_content:
+        return "no_op_patch", None, "Proposed edits produce no modification to original file", "no_op_patch"
+
+    # 7. Deterministic diff generation using Python difflib
+    orig_lines = original_content.splitlines(keepends=True)
+    mod_lines = modified_content.splitlines(keepends=True)
+    diff_lines = list(difflib.unified_diff(
+        orig_lines,
+        mod_lines,
+        fromfile=f"a/{finding.file_path}",
+        tofile=f"b/{finding.file_path}",
+    ))
+    diff_str = "".join(diff_lines)
+    if not diff_str.strip():
+        return "no_op_patch", None, "Unified diff generated from edits is empty", "no_op_patch"
+
+    # 8. In-memory syntax verification if applicable
+    if finding.file_path.endswith(".py"):
+        try:
+            compile(modified_content, finding.file_path, "exec")
+        except SyntaxError as syn_err:
+            return "malformed_edit", None, f"Generated patch creates Python syntax error: {syn_err.msg}", "syntax_error"
+    elif finding.file_path.endswith(".json"):
+        try:
+            json.loads(modified_content)
+        except Exception as json_err:
+            return "malformed_edit", None, f"Generated patch creates invalid JSON: {json_err}", "syntax_error"
+
+    explanation = candidate_dict.get("explanation") or finding.explanation or f"Fix {finding.title}"
+
+    return "success", {
+        "proposed_content": modified_content,
+        "diff": diff_str,
+        "change_summary": candidate_dict.get("explanation", f"Fix {finding.title}"),
+        "explanation": explanation,
+        "risks_assumptions": "Low risk minimal structured edit.",
+        "suggested_verification": "Check syntax and run regression tests.",
+    }, "", None
 
 
 def clean_json_text(text: Optional[str]) -> str:
@@ -633,43 +883,49 @@ def extract_patch_candidate(
     finding: Finding,
     original_content: str,
     repo_path: Optional[Path] = None,
+    diag: Optional[ResponseDiagnostics] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]], str]:
     """Parses and validates a candidate patch response from model text.
 
     Supports:
-    1. JSON with 'proposed_content'
-    2. JSON with 'diff' or 'patch'
-    3. Raw or fenced unified diff text
+    1. Primary: Structured JSON edits {"target_path": "...", "explanation": "...", "edits": [{"old_text": "...", "new_text": "..."}]}
+    2. Fallback: JSON with 'proposed_content'
+    3. Fallback: JSON with 'diff' or 'patch'
+    4. Fallback: Raw or fenced unified diff text
 
     Returns:
     (status, data_dict, error_detail)
-    where status is one of:
-    - 'success': data_dict contains proposed_content, diff, change_summary, etc.
-    - 'invalid_json': JSON structure attempted but malformed
-    - 'invalid_diff': diff attempted but malformed or does not apply cleanly
-    - 'invalid_path': path traversal, absolute path, or unexpected target file
-    - 'no_op_patch': proposed changes are identical to original content
-    - 'no_patch_content': text contains no recognizable patch or diff
     """
     if not raw_text or not isinstance(raw_text, str) or not raw_text.strip():
+        if diag:
+            diag.resembles_json = False
+            diag.is_fenced = False
+            diag.json_error_category = "empty_text"
         return "no_patch_content", None, "Empty model response text"
 
-    cleaned_json = clean_json_text(raw_text)
-    candidate_dict = None
-    json_decode_error = None
+    candidate_dict, json_meta = parse_json_response(raw_text)
 
-    if cleaned_json:
-        try:
-            parsed = json.loads(cleaned_json, strict=False)
-            if isinstance(parsed, dict):
-                candidate_dict = parsed
-        except (json.JSONDecodeError, ValueError) as err:
-            json_decode_error = err
+    if diag:
+        diag.resembles_json = json_meta["resembles_json"]
+        diag.is_fenced = json_meta["is_fenced"]
+        diag.json_error_category = json_meta["json_error_category"]
+        diag.json_error_position = json_meta["json_error_position"]
 
-    # Case 1: JSON with proposed_content
+    # Case 1: Primary contract - structured edits
+    if candidate_dict and ("edits" in candidate_dict or "target_path" in candidate_dict):
+        status, data, err_msg, edit_cat = validate_and_apply_structured_edits(
+            candidate_dict, finding, original_content, repo_path
+        )
+        if diag:
+            diag.edit_validation_category = edit_cat
+        return status, data, err_msg
+
+    # Case 2: Legacy fallback - JSON with proposed_content
     if candidate_dict and isinstance(candidate_dict.get("proposed_content"), str):
         proposed = candidate_dict["proposed_content"]
         if proposed.strip() == original_content.strip():
+            if diag:
+                diag.edit_validation_category = "no_op_patch"
             return "no_op_patch", None, "Model proposed_content is identical to original"
 
         diff_lines = list(difflib.unified_diff(
@@ -679,6 +935,8 @@ def extract_patch_candidate(
             tofile=f"b/{finding.file_path}",
         ))
         if not diff_lines:
+            if diag:
+                diag.edit_validation_category = "no_op_patch"
             return "no_op_patch", None, "Model proposed_content produced an empty unified diff"
 
         return "success", {
@@ -690,18 +948,24 @@ def extract_patch_candidate(
             "suggested_verification": candidate_dict.get("suggested_verification", "Check syntax and rerun tests."),
         }, ""
 
-    # Case 2: JSON with 'diff' or 'patch'
+    # Case 3: Legacy fallback - JSON with 'diff' or 'patch'
     if candidate_dict and (isinstance(candidate_dict.get("diff"), str) or isinstance(candidate_dict.get("patch"), str)):
         raw_diff = candidate_dict.get("diff") or candidate_dict.get("patch")
         target_path = extract_diff_target_path(raw_diff)
         valid, reason = validate_diff_path(target_path, finding.file_path, repo_path)
         if not valid:
-            return "invalid_path", None, f"Diff header target path rejected: {reason}"
+            if diag:
+                diag.edit_validation_category = reason
+            return "invalid_target_path", None, f"Diff header target path rejected: {reason}"
 
         applied = apply_unified_diff(original_content, raw_diff)
         if applied is None:
+            if diag:
+                diag.edit_validation_category = "invalid_diff"
             return "invalid_diff", None, "Diff in JSON could not apply cleanly to original content"
         if applied.strip() == original_content.strip():
+            if diag:
+                diag.edit_validation_category = "no_op_patch"
             return "no_op_patch", None, "Diff in JSON produced no changes"
 
         diff_lines = list(difflib.unified_diff(
@@ -719,17 +983,31 @@ def extract_patch_candidate(
             "suggested_verification": candidate_dict.get("suggested_verification", "Check syntax and rerun tests."),
         }, ""
 
-    # Case 3: Raw or fenced unified diff in raw_text
+    # If parsed as dict but missing edits and legacy fields:
+    if candidate_dict is not None:
+        if diag:
+            diag.edit_validation_category = "missing_edits"
+        return "missing_edits", None, "JSON missing required 'edits' field"
+
+    # If JSON parsing failed but text resembled JSON:
+    if json_meta.get("resembles_json"):
+        return "invalid_json", None, f"Malformed JSON: {json_meta.get('json_error_category') or 'syntax error'}"
+
+    # Legacy raw diff fallback
     cand_diff = extract_unified_diff(raw_text)
     if cand_diff:
         target_path = extract_diff_target_path(cand_diff)
         valid, reason = validate_diff_path(target_path, finding.file_path, repo_path)
         if not valid:
-            return "invalid_path", None, f"Diff header target path rejected: {reason}"
+            if diag:
+                diag.edit_validation_category = reason
+            return "invalid_target_path", None, f"Diff header target path rejected: {reason}"
 
         applied = apply_unified_diff(original_content, cand_diff)
         if applied is not None:
             if applied.strip() == original_content.strip():
+                if diag:
+                    diag.edit_validation_category = "no_op_patch"
                 return "no_op_patch", None, "Unified diff produced no changes"
 
             diff_lines = list(difflib.unified_diff(
@@ -747,22 +1025,11 @@ def extract_patch_candidate(
                 "suggested_verification": "Check syntax and rerun tests.",
             }, ""
         else:
+            if diag:
+                diag.edit_validation_category = "invalid_diff"
             return "invalid_diff", None, "Unified diff failed hunk matching against original content"
 
-    # Case 4: Neither parsed cleanly
-    has_json_markers = (
-        '{"' in raw_text
-        or "```json" in raw_text
-        or (candidate_dict is not None and not candidate_dict.get("proposed_content") and not candidate_dict.get("diff") and not candidate_dict.get("patch"))
-        or (cleaned_json.startswith("{") and "}" in cleaned_json)
-    )
-    if has_json_markers:
-        return "invalid_json", None, f"Malformed or incomplete JSON: {json_decode_error or 'invalid schema'}"
-
-    if "@@" in raw_text or "--- " in raw_text:
-        return "invalid_diff", None, "Malformed unified diff syntax"
-
-    return "no_patch_content", None, "Response contained conversational text but no reviewable patch or diff"
+    return "no_patch_content", None, "Response did not contain valid structured JSON edits"
 
 
 def log_sanitized_diagnostics(
@@ -781,10 +1048,12 @@ def log_sanitized_diagnostics(
     }
     logger.log(
         level,
-        "Hosted Gemma diagnostics [%s]: provider=%s, model=%s, has_response=%s, "
+        "Hosted Gemma diagnostics [%s]: finding_id=%s, provider=%s, model=%s, has_response=%s, "
         "candidates=%d, text_parts=%d, finish_reason=%s, block_reason=%s, "
-        "usage=%s, recovery_attempts=%d, failure_category=%s",
+        "resembles_json=%s, is_fenced=%s, json_error=%s, json_pos=%s, edit_error=%s, "
+        "recovery_outcome=%s, usage=%s, recovery_attempts=%d, failure_category=%s",
         stage,
+        diag.finding_id or "none",
         provider,
         model,
         diag.has_response,
@@ -792,6 +1061,12 @@ def log_sanitized_diagnostics(
         diag.text_part_count,
         diag.finish_reason or "none",
         diag.block_reason or "none",
+        diag.resembles_json,
+        diag.is_fenced,
+        diag.json_error_category or "none",
+        diag.json_error_position if diag.json_error_position is not None else "none",
+        diag.edit_validation_category or "none",
+        diag.recovery_outcome or "none",
         tokens_meta,
         recovery_attempts,
         diag.failure_category or "none",
@@ -806,6 +1081,8 @@ def record_diagnostics_to_span(
     """Attaches safe diagnostic metadata to Sentry span without sensitive payloads."""
     if not span:
         return
+    if diag.finding_id:
+        span.set_tag("finding_id", diag.finding_id)
     span.set_tag("has_response", diag.has_response)
     span.set_tag("candidate_count", diag.candidate_count)
     span.set_tag("text_part_count", diag.text_part_count)
@@ -813,6 +1090,16 @@ def record_diagnostics_to_span(
         span.set_tag("finish_reason", diag.finish_reason)
     if diag.block_reason:
         span.set_tag("block_reason", diag.block_reason)
+    span.set_tag("resembles_json", diag.resembles_json)
+    span.set_tag("is_fenced", diag.is_fenced)
+    if diag.json_error_category:
+        span.set_tag("json_error_category", diag.json_error_category)
+    if diag.json_error_position is not None:
+        span.set_data("json_error_position", diag.json_error_position)
+    if diag.edit_validation_category:
+        span.set_tag("edit_validation_category", diag.edit_validation_category)
+    if diag.recovery_outcome:
+        span.set_tag("recovery_outcome", diag.recovery_outcome)
     if diag.prompt_tokens is not None:
         span.set_data("prompt_tokens", diag.prompt_tokens)
     if diag.candidate_tokens is not None:
@@ -1380,18 +1667,23 @@ class GemmaApiProvider(BaseAIProvider):
             f"- File: {finding.file_path}\n"
             f"- Evidence: {bounded_evidence}\n"
             f"- Suggestion: {(finding.suggested_action or '')[:200]}\n\n"
-            f"Original file content:\n```\n{bounded_content}\n```\n\n"
-            f"Task: Propose the updated complete file content that addresses this finding with minimal disruption.\n"
+            f"Original file content of '{finding.file_path}':\n```\n{bounded_content}\n```\n\n"
+            f"Task: Propose minimal structured source edits to resolve this finding.\n"
             f"CRITICAL INSTRUCTIONS:\n"
-            f"1. Make ONLY the minimal change required to fix the finding.\n"
-            f"2. Keep 'change_summary', 'explanation', 'risks_assumptions', and 'suggested_verification' strictly to 1 concise sentence each. Do not write essay analysis.\n"
-            f"3. Return ONLY a single raw JSON object matching the schema below without markdown code fences or conversational text.\n\n"
+            f"1. Target file MUST be '{finding.file_path}'.\n"
+            f"2. Every 'old_text' MUST match the file contents above EXACTLY ONCE.\n"
+            f"3. Make ONLY the minimal change required.\n"
+            f"4. Do NOT propose overlapping edits.\n"
+            f"5. Return ONLY a single raw JSON object matching the contract below, with no conversational text or markdown code fences:\n\n"
             f"{{\n"
-            f'  "change_summary": "1 concise sentence describing change",\n'
-            f'  "proposed_content": "complete new file text",\n'
-            f'  "explanation": "1 concise sentence why this fix resolves the issue",\n'
-            f'  "risks_assumptions": "1 concise sentence on any assumptions or risks",\n'
-            f'  "suggested_verification": "1 concise sentence on how to verify the fix"\n'
+            f'  "target_path": "{finding.file_path}",\n'
+            f'  "explanation": "concise explanation of why this fix resolves the finding",\n'
+            f'  "edits": [\n'
+            f'    {{\n'
+            f'      "old_text": "exact existing snippet from the file",\n'
+            f'      "new_text": "replacement snippet"\n'
+            f'    }}\n'
+            f'  ]\n'
             f"}}"
         )
 
@@ -1423,6 +1715,7 @@ class GemmaApiProvider(BaseAIProvider):
                     thinking_level=patch_thinking_level,
                 )
                 diag = extract_response_diagnostics(response, max_expected_tokens=initial_max_tokens)
+                diag.finding_id = finding.id
 
                 data = None
                 candidate_status = "no_patch_content"
@@ -1430,14 +1723,23 @@ class GemmaApiProvider(BaseAIProvider):
 
                 if diag.extracted_text:
                     candidate_status, data, parse_err = extract_patch_candidate(
-                        diag.extracted_text, finding, file_content, repo_path
+                        diag.extracted_text, finding, file_content, repo_path, diag=diag
                     )
                     if candidate_status == "success":
                         diag.failure_category = "success"
                     elif diag.finish_reason == "MAX_TOKENS":
                         diag.failure_category = "output_truncated"
-                    elif candidate_status == "invalid_path":
+                    elif candidate_status == "invalid_target_path":
                         diag.failure_category = "invalid_target_path"
+                    elif candidate_status == "no_op_patch":
+                        diag.failure_category = "no_op_patch"
+                    elif candidate_status in {
+                        "missing_edits", "malformed_edit", "empty_old_text",
+                        "missing_old_text_match", "ambiguous_old_text", "overlapping_edits"
+                    }:
+                        diag.failure_category = "malformed_output"
+                    elif candidate_status == "invalid_json":
+                        diag.failure_category = "malformed_output"
                     else:
                         diag.failure_category = "malformed_output"
 
@@ -1448,7 +1750,7 @@ class GemmaApiProvider(BaseAIProvider):
                     )
                     record_diagnostics_to_span(span, diag, recovery_attempts=0)
 
-                    if not diag.is_recoverable or candidate_status == "invalid_path":
+                    if not diag.is_recoverable or candidate_status == "invalid_target_path":
                         span.set_data("recovery_attempt_count", 0)
                         span.set_data("rejection_reason", parse_err)
                         raise GemmaApiResponseError(
@@ -1475,65 +1777,50 @@ class GemmaApiProvider(BaseAIProvider):
                     recovery_max_tokens = Config.GEMMA_API_PATCH_RECOVERY_MAX_TOKENS
                     reduced_content = self._bound_file_content(file_content, finding, max_chars=1400)
 
-                    if diag.failure_category in {"output_truncated", "output_token_truncated"}:
-                        recovery_prompt = (
-                            f"{SYSTEM_INSTRUCTION}\n"
-                            f"The previous patch generation was truncated due to token budget limits.\n"
-                            f"Propose the smallest valid change needed to address this finding with minimal disruption:\n"
-                            f"- Finding: {finding.title[:150]}\n"
-                            f"- File: {finding.file_path}\n"
-                            f"- Evidence: {bounded_evidence[:150]}\n\n"
-                            f"Relevant file content:\n```\n{reduced_content}\n```\n\n"
-                            f"CRITICAL INSTRUCTIONS:\n"
-                            f"1. Make ONLY the minimal change required to fix the finding.\n"
-                            f"2. Keep 'change_summary', 'explanation', 'risks_assumptions', and 'suggested_verification' strictly to 1 concise sentence each.\n"
-                            f"3. Return ONLY a single valid JSON object matching the schema without markdown code blocks or conversational text:\n"
-                            f"{{\n"
-                            f'  "change_summary": "1 concise sentence describing fix",\n'
-                            f'  "proposed_content": "updated complete file text with fix applied",\n'
-                            f'  "explanation": "1 concise sentence explaining why this fix resolves the issue",\n'
-                            f'  "risks_assumptions": "1 concise sentence on any minimal risks or assumptions",\n'
-                            f'  "suggested_verification": "1 concise sentence on how to verify the fix"\n'
-                            f"}}"
-                        )
-                    elif candidate_status == "invalid_diff":
-                        recovery_prompt = (
-                            f"{SYSTEM_INSTRUCTION}\n"
-                            f"The previous unified diff could not apply cleanly to '{finding.file_path}'. Context lines did not match the file.\n"
-                            f"Provide a corrected, valid unified diff matching the exact lines in '{finding.file_path}' below:\n```\n{reduced_content}\n```\n\n"
-                            f"CRITICAL INSTRUCTIONS:\n"
-                            f"1. Output ONLY a valid unified diff starting with '--- a/{finding.file_path}' and '+++ b/{finding.file_path}'.\n"
-                            f"2. Ensure '-' lines and ' ' context lines match the exact file lines above.\n"
-                            f"3. Do NOT include conversational explanations or intro text."
-                        )
+                    category_msg = "The previous response could not be applied."
+                    if diag.finish_reason == "MAX_TOKENS" or diag.failure_category in {"output_truncated", "output_token_truncated"}:
+                        category_msg = "The previous patch generation was truncated due to token budget limits. Propose smaller, minimal edit snippets."
+                    elif diag.edit_validation_category == "missing_old_text_match":
+                        category_msg = f"The proposed 'old_text' was not found in '{finding.file_path}'. You must provide the exact existing snippet from the file content below."
+                    elif diag.edit_validation_category == "ambiguous_old_text":
+                        category_msg = f"The proposed 'old_text' matched multiple locations in '{finding.file_path}'. Include more surrounding context so 'old_text' matches exactly once."
+                    elif diag.edit_validation_category == "overlapping_edits":
+                        category_msg = "The proposed edits overlapped in the file content. Ensure each edit operates on a distinct, non-overlapping section."
+                    elif diag.edit_validation_category in {"missing_edits", "malformed_edit", "empty_old_text"}:
+                        category_msg = "The response must contain a non-empty 'edits' list with exact 'old_text' and 'new_text' strings."
+                    elif diag.edit_validation_category == "invalid_diff" or candidate_status == "invalid_diff":
+                        category_msg = f"The previous unified diff could not apply cleanly to '{finding.file_path}'. Context lines did not match the file."
                     elif candidate_status == "no_patch_content":
-                        recovery_prompt = (
-                            f"{SYSTEM_INSTRUCTION}\n"
-                            f"The previous response contained explanatory text but did not provide a reviewable patch or unified diff.\n"
-                            f"Provide ONLY a standard unified diff that resolves finding '{finding.title[:150]}' in file '{finding.file_path}'.\n"
-                            f"Relevant file content:\n```\n{reduced_content}\n```\n\n"
-                            f"CRITICAL INSTRUCTIONS:\n"
-                            f"1. Output ONLY a valid unified diff starting with '--- a/{finding.file_path}' and '+++ b/{finding.file_path}'.\n"
-                            f"2. Include valid '@@' hunk headers.\n"
-                            f"3. Do NOT include conversational explanations or introductory prose."
-                        )
-                    else:  # invalid_json or generic malformed
-                        recovery_prompt = (
-                            f"{SYSTEM_INSTRUCTION}\n"
-                            f"The previous response contained invalid or malformed JSON syntax.\n"
-                            f"Propose the fix for finding '{finding.title[:150]}' in file '{finding.file_path}'.\n"
-                            f"Relevant file content:\n```\n{reduced_content}\n```\n\n"
-                            f"CRITICAL INSTRUCTIONS:\n"
-                            f"1. Make ONLY the minimal change required.\n"
-                            f"2. Output ONLY a single valid raw JSON object matching the schema below without markdown code fences or conversational text:\n"
-                            f"{{\n"
-                            f'  "change_summary": "1 concise sentence describing fix",\n'
-                            f'  "proposed_content": "complete updated file text",\n'
-                            f'  "explanation": "1 concise sentence why this fix resolves the issue",\n'
-                            f'  "risks_assumptions": "1 concise sentence on any minimal risks or assumptions",\n'
-                            f'  "suggested_verification": "1 concise sentence on how to verify the fix"\n'
-                            f"}}"
-                        )
+                        category_msg = "The previous response contained explanatory text but did not provide a reviewable patch or unified diff."
+                    else:
+                        category_msg = f"The previous response contained invalid or malformed JSON syntax ({diag.json_error_category or 'syntax error'}). Output valid JSON only."
+
+                    recovery_prompt = (
+                        f"{SYSTEM_INSTRUCTION}\n"
+                        f"Validation failure category: {diag.edit_validation_category or diag.json_error_category or diag.failure_category}\n"
+                        f"Correction required: {category_msg}\n\n"
+                        f"Finding to fix:\n"
+                        f"- Title: {finding.title[:150]}\n"
+                        f"- File: {finding.file_path}\n"
+                        f"- Evidence: {bounded_evidence[:150]}\n\n"
+                        f"Original file content of '{finding.file_path}':\n```\n{reduced_content}\n```\n\n"
+                        f"CRITICAL INSTRUCTIONS:\n"
+                        f"1. Target file MUST be '{finding.file_path}'.\n"
+                        f"2. Every 'old_text' MUST match the file contents above EXACTLY ONCE.\n"
+                        f"3. Make ONLY the minimal change required.\n"
+                        f"4. Do NOT propose overlapping edits.\n"
+                        f"5. Return ONLY a single raw JSON object matching the contract:\n\n"
+                        f"{{\n"
+                        f'  "target_path": "{finding.file_path}",\n'
+                        f'  "explanation": "concise explanation of why this fix resolves the finding",\n'
+                        f'  "edits": [\n'
+                        f'    {{\n'
+                        f'      "old_text": "exact existing snippet from the file",\n'
+                        f'      "new_text": "replacement snippet"\n'
+                        f'    }}\n'
+                        f'  ]\n'
+                        f"}}"
+                    )
 
                     logger.info(
                         "Hosted Gemma patch recoverable response (%s / %s). Attempting bounded recovery (1/1) with %.2fs remaining budget...",
@@ -1548,20 +1835,39 @@ class GemmaApiProvider(BaseAIProvider):
                         thinking_level=patch_thinking_level,
                     )
                     rec_diag = extract_response_diagnostics(rec_response, max_expected_tokens=recovery_max_tokens)
+                    rec_diag.finding_id = finding.id
 
                     if rec_diag.extracted_text:
                         rec_status, rec_data, rec_parse_err = extract_patch_candidate(
-                            rec_diag.extracted_text, finding, file_content, repo_path
+                            rec_diag.extracted_text, finding, file_content, repo_path, diag=rec_diag
                         )
                         if rec_status == "success":
                             data = rec_data
                             rec_diag.failure_category = "success"
+                            rec_diag.recovery_outcome = "recovered"
                         elif rec_diag.finish_reason == "MAX_TOKENS":
                             rec_diag.failure_category = "output_truncated"
-                        elif rec_status == "invalid_path":
+                            rec_diag.recovery_outcome = "failed"
+                        elif rec_status == "invalid_target_path":
                             rec_diag.failure_category = "invalid_target_path"
+                            rec_diag.recovery_outcome = "failed"
+                        elif rec_status == "no_op_patch":
+                            rec_diag.failure_category = "no_op_patch"
+                            rec_diag.recovery_outcome = "failed"
+                        elif rec_status in {
+                            "missing_edits", "malformed_edit", "empty_old_text",
+                            "missing_old_text_match", "ambiguous_old_text", "overlapping_edits"
+                        }:
+                            rec_diag.failure_category = "malformed_output"
+                            rec_diag.recovery_outcome = "failed"
+                        elif rec_status == "invalid_json":
+                            rec_diag.failure_category = "malformed_output"
+                            rec_diag.recovery_outcome = "failed"
                         else:
                             rec_diag.failure_category = "malformed_output"
+                            rec_diag.recovery_outcome = "failed"
+                    else:
+                        rec_diag.recovery_outcome = "failed"
 
                     if data is None:
                         log_sanitized_diagnostics(

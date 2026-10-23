@@ -17,10 +17,13 @@ from backend.ai.gemma_api_provider import (
     classify_patch_error,
     clean_json_text,
     extract_error_code,
+    extract_patch_candidate,
     extract_response_diagnostics,
     extract_response_text,
     is_transient_error,
+    parse_json_response,
     sanitize_error_message,
+    validate_and_apply_structured_edits,
 )
 from backend.app import create_app
 from backend.config import Config
@@ -3011,5 +3014,625 @@ def test_sentry_classification_and_truthful_ai_assisted_status(tmp_path):
         val_str = str(val)
         assert "# Readme" not in val_str
         assert "sample-evidence" not in val_str
+
+
+# ==============================================================================
+# Regression Suite: Deterministic Patch Construction with Structured Edits
+# ==============================================================================
+
+
+def test_regression_1_valid_json_edit_operations_generate_valid_unified_diff(tmp_path):
+    """1. Valid JSON edit operations generate a valid unified diff with difflib."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = (
+        "# User Guide\n\n"
+        "Please visit [old doc](http://broken.local) for details.\n\n"
+        "End of guide.\n"
+    )
+    finding = Finding(
+        id="f-reg-1",
+        category=FindingCategory.DOCUMENTATION,
+        title="Fix broken link",
+        file_path="docs/guide.md",
+        evidence="[old doc](http://broken.local)",
+        explanation="Link is broken",
+        suggested_action="Update link URL",
+    )
+
+    model_response = json.dumps({
+        "target_path": "docs/guide.md",
+        "explanation": "Update link to point to working documentation URL",
+        "edits": [
+            {
+                "old_text": "[old doc](http://broken.local)",
+                "new_text": "[official doc](https://example.com/docs)",
+            }
+        ],
+    })
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(model_response)
+
+    patch = provider.propose_patch(finding, original_content, tmp_path, run_id="run-reg-1")
+    assert patch is not None
+    assert patch.finding_id == "f-reg-1"
+    assert patch.file_path == "docs/guide.md"
+    assert patch.status == PatchStatus.PENDING
+    assert patch.proposed_content == (
+        "# User Guide\n\n"
+        "Please visit [official doc](https://example.com/docs) for details.\n\n"
+        "End of guide.\n"
+    )
+    assert "--- a/docs/guide.md" in patch.diff
+    assert "+++ b/docs/guide.md" in patch.diff
+    assert "-Please visit [old doc](http://broken.local) for details." in patch.diff
+    assert "+Please visit [official doc](https://example.com/docs) for details." in patch.diff
+    assert patch.explanation == "Update link to point to working documentation URL"
+
+
+def test_regression_2_fenced_json_is_parsed_safely(tmp_path):
+    """2. Fenced JSON is parsed safely with markdown code fences and whitespace."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = "TIMEOUT = 10\n"
+    finding = Finding(
+        id="f-reg-2",
+        category=FindingCategory.CONFIGURATION,
+        title="Increase timeout",
+        file_path="settings.py",
+        evidence="TIMEOUT = 10",
+        explanation="Need higher timeout",
+        suggested_action="Set TIMEOUT = 30",
+    )
+
+    fenced_output = (
+        "   \n```json\n"
+        + json.dumps({
+            "target_path": "settings.py",
+            "explanation": "Increase connection timeout to 30s",
+            "edits": [
+                {
+                    "old_text": "TIMEOUT = 10",
+                    "new_text": "TIMEOUT = 30",
+                }
+            ],
+        })
+        + "\n```\n   "
+    )
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(fenced_output)
+
+    patch = provider.propose_patch(finding, original_content, tmp_path, run_id="run-reg-2")
+    assert patch is not None
+    assert patch.proposed_content == "TIMEOUT = 30\n"
+    assert "+TIMEOUT = 30" in patch.diff
+
+
+def test_regression_3_expected_finding_file_is_only_file_modified(tmp_path):
+    """3. The expected finding file is the only file that can be modified."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = "SECRET = 'old'\n"
+    finding = Finding(
+        id="f-reg-3",
+        category=FindingCategory.CONFIGURATION,
+        title="Rotate secret",
+        file_path="src/config.py",
+        evidence="SECRET = 'old'",
+        explanation="Secret must rotate",
+        suggested_action="Rotate",
+    )
+
+    # Model proposes edits for a DIFFERENT file
+    wrong_file_output = json.dumps({
+        "target_path": "src/other.py",
+        "explanation": "Mistaken file target",
+        "edits": [
+            {
+                "old_text": "SECRET = 'old'",
+                "new_text": "SECRET = 'new'",
+            }
+        ],
+    })
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(wrong_file_output)
+
+    res_patch = provider.propose_patch(finding, original_content, tmp_path, run_id="run-reg-3")
+    assert res_patch is None
+    # Verify no recovery was attempted because invalid_target_path is immediately non-recoverable
+    assert mock_client.models.generate_content.call_count == 1
+
+
+def test_regression_4_missing_or_ambiguous_old_text_rejected(tmp_path):
+    """4. A missing or ambiguous old_text is rejected."""
+    file_content = (
+        "item = 1\n"
+        "item = 1\n"
+        "unique = 42\n"
+    )
+    finding = Finding(
+        id="f-reg-4",
+        category=FindingCategory.CONFIGURATION,
+        title="Update item",
+        file_path="app.py",
+        evidence="item = 1",
+        explanation="Update item",
+        suggested_action="Update",
+    )
+
+    # 4A: Missing old_text (does not exist in file)
+    missing_edit = {
+        "target_path": "app.py",
+        "explanation": "Nonexistent text",
+        "edits": [{"old_text": "does_not_exist = True", "new_text": "exists = True"}],
+    }
+    status, data, err_msg, edit_cat = validate_and_apply_structured_edits(
+        missing_edit, finding, file_content, tmp_path
+    )
+    assert status == "missing_old_text_match"
+    assert edit_cat == "missing_old_text_match"
+    assert data is None
+
+    # 4B: Ambiguous old_text (exists 2 times)
+    ambiguous_edit = {
+        "target_path": "app.py",
+        "explanation": "Ambiguous text",
+        "edits": [{"old_text": "item = 1", "new_text": "item = 2"}],
+    }
+    status2, data2, err_msg2, edit_cat2 = validate_and_apply_structured_edits(
+        ambiguous_edit, finding, file_content, tmp_path
+    )
+    assert status2 == "ambiguous_old_text"
+    assert edit_cat2 == "ambiguous_old_text"
+    assert data2 is None
+
+
+def test_regression_5_path_traversal_absolute_paths_and_symlink_escapes_rejected(tmp_path):
+    """5. Path traversal, absolute paths and symlink escapes are rejected."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-reg-5",
+        category=FindingCategory.CONFIGURATION,
+        title="Path safety check",
+        file_path="data/store.py",
+        evidence="ev",
+        explanation="exp",
+        suggested_action="act",
+    )
+
+    # 5A: Path traversal with ..
+    traversal_json = json.dumps({
+        "target_path": "data/../../etc/passwd",
+        "explanation": "Exploit traversal",
+        "edits": [{"old_text": "a", "new_text": "b"}],
+    })
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(traversal_json)
+    patch1 = provider.propose_patch(finding, "a = 1\n", tmp_path, run_id="run-reg-5a")
+    assert patch1 is None
+
+    # 5B: Absolute path
+    abs_json = json.dumps({
+        "target_path": "/etc/passwd",
+        "explanation": "Exploit absolute path",
+        "edits": [{"old_text": "a", "new_text": "b"}],
+    })
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(abs_json)
+    patch2 = provider.propose_patch(finding, "a = 1\n", tmp_path, run_id="run-reg-5b")
+    assert patch2 is None
+
+    # 5C: Symlink target
+    symlink_file = tmp_path / "data" / "store.py"
+    symlink_file.parent.mkdir(parents=True, exist_ok=True)
+    outside_target = tmp_path.parent / "outside.txt"
+    outside_target.write_text("secret\n", encoding="utf-8")
+    try:
+        symlink_file.symlink_to(outside_target)
+    except OSError:
+        pass
+    if symlink_file.is_symlink():
+        sym_json = json.dumps({
+            "target_path": "data/store.py",
+            "explanation": "Exploit symlink",
+            "edits": [{"old_text": "secret", "new_text": "hacked"}],
+        })
+        mock_client.models.generate_content.return_value = _make_mock_genai_response(sym_json)
+        patch3 = provider.propose_patch(finding, "secret\n", tmp_path, run_id="run-reg-5c")
+        assert patch3 is None
+
+
+def test_regression_6_multiple_non_overlapping_edits_applied_deterministically(tmp_path):
+    """6. Multiple non-overlapping edits are applied deterministically."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = (
+        "def service_a():\n"
+        "    port = 8001\n"
+        "    return port\n\n"
+        "def service_b():\n"
+        "    port = 8002\n"
+        "    return port\n\n"
+        "def service_c():\n"
+        "    port = 8003\n"
+        "    return port\n"
+    )
+    finding = Finding(
+        id="f-reg-6",
+        category=FindingCategory.CONFIGURATION,
+        title="Update services a and c",
+        file_path="services.py",
+        evidence="ports",
+        explanation="Update port numbers",
+        suggested_action="Update a and c",
+    )
+
+    # Provide edits in REVERSE file order to test deterministic span sorting
+    model_response = json.dumps({
+        "target_path": "services.py",
+        "explanation": "Update service_c and service_a ports simultaneously",
+        "edits": [
+            {
+                "old_text": "    port = 8003",
+                "new_text": "    port = 9003",
+            },
+            {
+                "old_text": "    port = 8001",
+                "new_text": "    port = 9001",
+            },
+        ],
+    })
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(model_response)
+
+    patch_obj = provider.propose_patch(finding, original_content, tmp_path, run_id="run-reg-6")
+    assert patch_obj is not None
+    assert patch_obj.proposed_content == (
+        "def service_a():\n"
+        "    port = 9001\n"
+        "    return port\n\n"
+        "def service_b():\n"
+        "    port = 8002\n"
+        "    return port\n\n"
+        "def service_c():\n"
+        "    port = 9003\n"
+        "    return port\n"
+    )
+    # Check that service_b was NOT touched
+    assert "    port = 8002" in patch_obj.proposed_content
+    # Check both changes in diff
+    assert "-    port = 8001" in patch_obj.diff
+    assert "+    port = 9001" in patch_obj.diff
+    assert "-    port = 8003" in patch_obj.diff
+    assert "+    port = 9003" in patch_obj.diff
+
+
+def test_regression_7_invalid_json_does_not_produce_patch(tmp_path):
+    """7. Invalid JSON does not produce a patch."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-reg-7",
+        category=FindingCategory.CONFIGURATION,
+        title="Fix syntax",
+        file_path="app.py",
+        evidence="err",
+        explanation="exp",
+        suggested_action="act",
+    )
+
+    # Call 1: Invalid truncated JSON
+    resp1 = _make_mock_genai_response('{"target_path": "app.py", "edits": [')
+    # Call 2: Still invalid JSON
+    resp2 = _make_mock_genai_response('{invalid_json_without_quotes: true')
+
+    mock_client.models.generate_content.side_effect = [resp1, resp2]
+
+    res_patch = provider.propose_patch(finding, "x = 1\n", tmp_path, run_id="run-reg-7")
+    assert res_patch is None
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_regression_8_initial_invalid_output_followed_by_valid_recovery_produces_valid_proposal(tmp_path):
+    """8. Initial invalid output followed by a valid recovery produces a valid proposal."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = "DEBUG = True\n"
+    finding = Finding(
+        id="f-reg-8",
+        category=FindingCategory.CONFIGURATION,
+        title="Disable debug",
+        file_path="config.py",
+        evidence="DEBUG = True",
+        explanation="Disable debug mode",
+        suggested_action="Set DEBUG = False",
+    )
+
+    # Attempt 1: Edit with missing old_text match
+    bad_edit_resp = _make_mock_genai_response(json.dumps({
+        "target_path": "config.py",
+        "explanation": "Wrong snippet",
+        "edits": [{"old_text": "DEBUG_MODE = True", "new_text": "DEBUG_MODE = False"}],
+    }))
+
+    # Attempt 2: Correct recovery edit
+    good_edit_resp = _make_mock_genai_response(json.dumps({
+        "target_path": "config.py",
+        "explanation": "Corrected snippet",
+        "edits": [{"old_text": "DEBUG = True", "new_text": "DEBUG = False"}],
+    }))
+
+    mock_client.models.generate_content.side_effect = [bad_edit_resp, good_edit_resp]
+
+    fake_span = MagicMock()
+    fake_span_context = MagicMock(__enter__=MagicMock(return_value=fake_span), __exit__=MagicMock(return_value=False))
+
+    with patch("backend.ai.gemma_api_provider.agent_stage_span", return_value=fake_span_context):
+        patch_result = provider.propose_patch(finding, original_content, tmp_path, run_id="run-reg-8")
+
+    assert patch_result is not None
+    assert patch_result.proposed_content == "DEBUG = False\n"
+    assert mock_client.models.generate_content.call_count == 2
+
+    span_data = {call[0][0]: call[0][1] for call in fake_span.set_data.call_args_list}
+    assert span_data.get("recovery_attempted") is True
+    assert span_data.get("recovery_outcome") == "recovered"
+
+
+def test_regression_9_repeated_invalid_output_produces_truthful_failure_without_crashing_run(tmp_path):
+    """9. Repeated invalid output produces a truthful failure without crashing the maintenance run."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    test_file = tmp_path / "broken.py"
+    test_file.write_text("x = 1\n", encoding="utf-8")
+
+    finding = Finding(
+        id="f-reg-9",
+        category=FindingCategory.CONFIGURATION,
+        title="Syntax error",
+        file_path="broken.py",
+        evidence="x = 1",
+        explanation="Update x",
+        suggested_action="x = 2",
+        severity=Severity.HIGH,
+        ai_assisted=True,
+    )
+
+    # Both initial and recovery return invalid prose without JSON
+    resp1 = _make_mock_genai_response("I suggest changing x to 2.", finish_reason="STOP")
+    resp2 = _make_mock_genai_response("Still just prose here.", finish_reason="STOP")
+    mock_client.models.generate_content.side_effect = [resp1, resp2]
+
+    agent = AgentService(provider_name="gemma_api")
+    agent.provider = provider
+
+    with patch.object(agent.scan_engine, "discover_files", return_value=([test_file], 10)), \
+         patch.object(agent.scan_engine, "run_scanners", return_value=([finding], {})), \
+         patch.object(provider, "analyze_and_prioritize", return_value=[finding]):
+
+        run = agent.execute_maintenance_run(
+            repo_path=tmp_path,
+            repo_name="FailSafeRepo",
+            repo_type="local",
+            run_id="run-reg-9",
+        )
+
+    # Maintenance run completed without crashing
+    assert run.status == "completed"
+    assert len(run.patches) == 0
+    assert run.stages["proposal"].status == "failed"
+    assert "0 preserved" in run.stages["proposal"].details
+
+
+def test_regression_10_transient_http_500_followed_by_success_remains_supported(tmp_path):
+    """10. A transient HTTP 500 followed by success remains supported."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    original_content = "VAL = 1\n"
+    finding = Finding(
+        id="f-reg-10",
+        category=FindingCategory.CONFIGURATION,
+        title="Update VAL",
+        file_path="const.py",
+        evidence="VAL = 1",
+        explanation="VAL should be 2",
+        suggested_action="VAL = 2",
+    )
+
+    good_resp = _make_mock_genai_response(json.dumps({
+        "target_path": "const.py",
+        "explanation": "Update VAL to 2",
+        "edits": [{"old_text": "VAL = 1", "new_text": "VAL = 2"}],
+    }))
+
+    # Attempt 1: 500 ServerError, Attempt 2: Success
+    mock_client.models.generate_content.side_effect = [
+        genai_errors.ServerError(500, "Internal Server Error"),
+        good_resp,
+    ]
+
+    with patch("time.sleep", return_value=None):
+        proposed_patch = provider.propose_patch(finding, original_content, tmp_path, run_id="run-reg-10")
+
+    assert proposed_patch is not None
+    assert proposed_patch.proposed_content == "VAL = 2\n"
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_regression_11_later_proposal_failure_never_removes_earlier_valid_patch(tmp_path):
+    """11. A later proposal failure never removes an earlier valid patch."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    f1_file = tmp_path / "file1.py"
+    f1_file.write_text("a = 1\n", encoding="utf-8")
+    f2_file = tmp_path / "file2.py"
+    f2_file.write_text("b = 2\n", encoding="utf-8")
+
+    f1 = Finding(
+        id="f-valid-first",
+        category=FindingCategory.CONFIGURATION,
+        title="Fix file 1",
+        file_path="file1.py",
+        evidence="a = 1",
+        explanation="Fix a",
+        suggested_action="Fix a",
+        severity=Severity.LOW,
+        ai_assisted=True,
+    )
+    f2 = Finding(
+        id="f-broken-second",
+        category=FindingCategory.DOCUMENTATION,
+        title="Fix file 2",
+        file_path="file2.py",
+        evidence="b = 2",
+        explanation="Fix b",
+        suggested_action="Fix b",
+        severity=Severity.LOW,
+        ai_assisted=True,
+    )
+
+    # Finding 1 succeeds: valid structured edit
+    resp_f1 = _make_mock_genai_response(json.dumps({
+        "target_path": "file1.py",
+        "explanation": "Update a to 10",
+        "edits": [{"old_text": "a = 1", "new_text": "a = 10"}],
+    }))
+    # Finding 2 fails initially and on recovery
+    resp_f2_1 = _make_mock_genai_response("unusable text 1")
+    resp_f2_2 = _make_mock_genai_response("unusable text 2")
+
+    mock_client.models.generate_content.side_effect = [resp_f1, resp_f2_1, resp_f2_2]
+
+    agent = AgentService(provider_name="gemma_api")
+    agent.provider = provider
+
+    with patch.object(agent.scan_engine, "discover_files", return_value=([f1_file, f2_file], 20)), \
+         patch.object(agent.scan_engine, "run_scanners", return_value=([f1, f2], {})), \
+         patch.object(provider, "analyze_and_prioritize", return_value=[f1, f2]):
+
+        run = agent.execute_maintenance_run(
+            repo_path=tmp_path,
+            repo_name="PreserveTestRepo",
+            repo_type="local",
+            run_id="run-reg-11",
+        )
+
+    # Crucial assertion: Patch 1 is PRESERVED!
+    assert len(run.patches) == 1
+    assert run.patches[0].finding_id == "f-valid-first"
+    assert run.stages["proposal"].status == "partial"
+    assert "1/2 patches" in run.stages["proposal"].details
+    assert "1 patch generation attempts failed" in run.stages["proposal"].details
+
+
+def test_regression_12_truthful_ai_assisted_status_fix_queue_and_sentry_reporting(tmp_path):
+    """12. AI-assisted status, Fix Queue status, Sentry reporting and partial-stage reporting remain truthful."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    finding = Finding(
+        id="f-reg-12",
+        category=FindingCategory.DOCUMENTATION,
+        title="Doc typo",
+        file_path="README.md",
+        evidence="QuietPach",
+        explanation="Typo in project name",
+        suggested_action="Fix QuietPatch",
+        severity=Severity.LOW,
+    )
+
+    valid_resp = _make_mock_genai_response(
+        json.dumps({
+            "target_path": "README.md",
+            "explanation": "Fix typo in name",
+            "edits": [{"old_text": "QuietPach", "new_text": "QuietPatch"}],
+        }),
+        finish_reason="STOP",
+        prompt_tokens=410,
+        candidate_tokens=95,
+        total_tokens=505,
+    )
+    mock_client.models.generate_content.return_value = valid_resp
+
+    fake_span = MagicMock()
+    fake_span_context = MagicMock(__enter__=MagicMock(return_value=fake_span), __exit__=MagicMock(return_value=False))
+
+    with patch("backend.ai.gemma_api_provider.agent_stage_span", return_value=fake_span_context):
+        proposed_patch = provider.propose_patch(finding, "# QuietPach\n", tmp_path, run_id="run-reg-12")
+
+    assert proposed_patch is not None
+    # Fix Queue status
+    assert proposed_patch.status == PatchStatus.PENDING
+    assert proposed_patch.is_demo is False
+    assert proposed_patch.ai_model == "gemma-4-26b-a4b-it"
+
+    # Sentry span attributes
+    span_tags = {call[0][0]: call[0][1] for call in fake_span.set_tag.call_args_list}
+    span_data = {call[0][0]: call[0][1] for call in fake_span.set_data.call_args_list}
+
+    assert span_tags.get("finding_id") == "f-reg-12"
+    assert span_tags.get("has_response") is True
+    assert span_tags.get("finish_reason") == "STOP"
+    assert span_tags.get("resembles_json") is True
+    assert span_tags.get("is_fenced") is False
+    assert span_data.get("prompt_tokens") == 410
+    assert span_data.get("candidate_tokens") == 95
+    assert span_data.get("total_tokens") == 505
+
+
+def test_regression_13_no_patch_applied_to_disk_automatically(tmp_path):
+    """13. No patch is applied to disk automatically during proposal generation."""
+    provider = GemmaApiProvider(api_key="valid-key", model="gemma-4-26b-a4b-it")
+    mock_client = MagicMock()
+    provider._client = mock_client
+
+    target_file = tmp_path / "app.py"
+    target_file.write_text("MODE = 'development'\n", encoding="utf-8")
+
+    finding = Finding(
+        id="f-reg-13",
+        category=FindingCategory.CONFIGURATION,
+        title="Set production mode",
+        file_path="app.py",
+        evidence="MODE = 'development'",
+        explanation="Production required",
+        suggested_action="Set MODE = 'production'",
+    )
+
+    model_output = json.dumps({
+        "target_path": "app.py",
+        "explanation": "Switch to production mode",
+        "edits": [{"old_text": "MODE = 'development'", "new_text": "MODE = 'production'"}],
+    })
+    mock_client.models.generate_content.return_value = _make_mock_genai_response(model_output)
+
+    res_patch = provider.propose_patch(finding, "MODE = 'development'\n", tmp_path, run_id="run-reg-13")
+    assert res_patch is not None
+
+    # CRITICAL SECURITY CHECK: The file on disk was NEVER modified!
+    disk_content = target_file.read_text(encoding="utf-8")
+    assert disk_content == "MODE = 'development'\n"
+    assert "production" not in disk_content
+
+    # Ensure no temporary backup or staging files were written to repo
+    assert not (tmp_path / "app.py.qp_tmp").exists()
+    assert not (tmp_path / ".quietpatch").exists()
+
 
 
